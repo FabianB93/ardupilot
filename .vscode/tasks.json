@@ -2,6 +2,25 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "ArduPilot: Configure ESP32-S3",
+            "type": "shell",
+            "command": "/bin/zsh",
+            "args": [
+                "-lc",
+                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && source modules/esp_idf/export.sh && ./waf configure --board=esp32s3devkit --debug"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "ArduPilot: Build Plane",
             "type": "shell",
             "command": "/bin/zsh",
@@ -11,6 +30,20 @@
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": [
+                "ArduPilot: Configure ESP32-S3"
+            ],
+            "dependsOrder": "sequence",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "clear": true
             },
             "problemMatcher": []
         },
@@ -25,15 +58,39 @@
             "options": {
                 "cwd": "${workspaceFolder}/build/esp32s3devkit/esp-idf_build"
             },
-            "dependsOn": [
-                "ArduPilot: Build Plane"
-            ],
-            "dependsOrder": "sequence",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "clear": true
+            },
             "problemMatcher": []
         },
         {
-            "label": "ArduPilot: Build + Flash",
+            "label": "ArduPilot: Start OpenOCD",
+            "type": "shell",
+            "command": "/bin/zsh",
+            "args": [
+                "-lc",
+                "pkill -x openocd 2>/dev/null || true; exec /Users/Fabian/.espressif/tools/openocd-esp32/v0.12.0-esp32-20240318/openocd-esp32/bin/openocd -s /Users/Fabian/.espressif/tools/openocd-esp32/v0.12.0-esp32-20240318/openocd-esp32/share/openocd/scripts -f board/esp32s3-builtin.cfg -c \"adapter speed 1000\" -c \"init\" -c \"reset halt\" -c \"esp appimage_offset 0x20000\""
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": false,
+                "clear": true,
+                "showReuseMessage": false
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "ArduPilot: Build and Flash",
             "dependsOn": [
+                "ArduPilot: Build Plane",
                 "ArduPilot: Flash ESP32-S3"
             ],
             "dependsOrder": "sequence",

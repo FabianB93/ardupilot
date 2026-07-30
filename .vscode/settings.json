@@ -1,0 +1,23 @@
+{
+    "VsCodeTaskButtons.showCounter": false,
+    "VsCodeTaskButtons.tasks": [
+        {
+            "label": "$(tools) Build",
+            "task": "ArduPilot: Build Plane",
+            "alignment": "left",
+            "tooltip": "Build ArduPilot Plane"
+        },
+        {
+            "label": "$(cloud-download) Flash",
+            "task": "ArduPilot: Flash ESP32-S3",
+            "alignment": "left",
+            "tooltip": "Flash ArduPilot to ESP32-S3"
+        },
+        {
+            "label": "$(debug-start) Start OpenOCD",
+            "task": "ArduPilot: Start OpenOCD",
+            "alignment": "left",
+            "tooltip": "Start the OpenOCD debug server"
+        }
+    ]
+}

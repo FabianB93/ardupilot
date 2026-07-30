@@ -17,27 +17,27 @@
 
             "setupCommands": [
                 {
-                    "description": "GDB-Ausgaben vereinfachen",
+                    "description": "Disable GDB pagination",
                     "text": "set pagination off",
                     "ignoreFailures": true
                 },
                 {
-                    "description": "Remote-Timeout",
+                    "description": "Configure remote timeout",
                     "text": "set remotetimeout 20",
                     "ignoreFailures": false
                 },
                 {
-                    "description": "Mit OpenOCD verbinden",
+                    "description": "Connect to OpenOCD",
                     "text": "target extended-remote localhost:3333",
                     "ignoreFailures": false
                 },
                 {
-                    "description": "ESP32-S3 zurücksetzen und anhalten",
+                    "description": "Reset and halt ESP32-S3",
                     "text": "monitor reset halt",
                     "ignoreFailures": false
                 },
                 {
-                    "description": "Registercache leeren",
+                    "description": "Flush GDB register cache",
                     "text": "maintenance flush register-cache",
                     "ignoreFailures": true
                 }
