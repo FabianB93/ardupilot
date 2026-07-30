@@ -112,7 +112,7 @@ GRTAGS
 GTAGS
 *.apj
 .gdbinit
-.vscode/*
+#.vscode/*
 !.vscode/extensions.json
 .cache/
 /.history

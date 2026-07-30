@@ -1,0 +1,43 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ArduPilot: Build Plane",
+            "type": "shell",
+            "command": "/bin/zsh",
+            "args": [
+                "-lc",
+                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && source modules/esp_idf/export.sh && ./waf plane"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "ArduPilot: Flash ESP32-S3",
+            "type": "shell",
+            "command": "/bin/zsh",
+            "args": [
+                "-lc",
+                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && python -m esptool --chip esp32s3 --port /dev/cu.usbmodem11301 write_flash @flash_args"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build/esp32s3devkit/esp-idf_build"
+            },
+            "dependsOn": [
+                "ArduPilot: Build Plane"
+            ],
+            "dependsOrder": "sequence",
+            "problemMatcher": []
+        },
+        {
+            "label": "ArduPilot: Build + Flash",
+            "dependsOn": [
+                "ArduPilot: Flash ESP32-S3"
+            ],
+            "dependsOrder": "sequence",
+            "problemMatcher": []
+        }
+    ]
+}

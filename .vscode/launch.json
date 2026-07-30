@@ -1,0 +1,55 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "ArduPilot ESP32-S3: Debug",
+            "type": "cppdbg",
+            "request": "launch",
+
+            "program": "${workspaceFolder}/build/esp32s3devkit/esp-idf_build/ardupilot.elf",
+            "cwd": "${workspaceFolder}",
+
+            "MIMode": "gdb",
+            "miDebuggerPath": "/Users/Fabian/.espressif/tools/xtensa-esp-elf-gdb/14.2_20240403/xtensa-esp-elf-gdb/bin/xtensa-esp32s3-elf-gdb",
+
+            "stopAtEntry": false,
+            "externalConsole": false,
+
+            "setupCommands": [
+                {
+                    "description": "GDB-Ausgaben vereinfachen",
+                    "text": "set pagination off",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Remote-Timeout",
+                    "text": "set remotetimeout 20",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Mit OpenOCD verbinden",
+                    "text": "target extended-remote localhost:3333",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "ESP32-S3 zurücksetzen und anhalten",
+                    "text": "monitor reset halt",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Registercache leeren",
+                    "text": "maintenance flush register-cache",
+                    "ignoreFailures": true
+                }
+            ],
+
+            "launchCompleteCommand": "exec-continue",
+
+            "logging": {
+                "engineLogging": false,
+                "trace": false,
+                "traceResponse": false
+            }
+        }
+    ]
+}
