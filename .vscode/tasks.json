@@ -88,6 +88,27 @@
             "problemMatcher": []
         },
         {
+            "label": "ArduPilot: Start Serial Monitor",
+            "type": "shell",
+            "command": "/bin/zsh",
+            "args": [
+                "-lc",
+                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && exec python -m serial.tools.miniterm /dev/cu.usbserial-140 115200 --raw"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "isBackground": true,
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated",
+                "focus": true,
+                "clear": true,
+                "showReuseMessage": false
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "ArduPilot: Build and Flash",
             "dependsOn": [
                 "ArduPilot: Build Plane",

@@ -18,6 +18,12 @@
             "task": "ArduPilot: Start OpenOCD",
             "alignment": "left",
             "tooltip": "Start the OpenOCD debug server"
+        },
+        {
+            "label": "$(terminal) Serial Monitor",
+            "task": "ArduPilot: Start Serial Monitor",
+            "alignment": "left",
+            "tooltip": "Open the ESP32-S3 serial monitor"
         }
     ]
 }
