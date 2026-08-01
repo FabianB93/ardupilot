@@ -89,14 +89,18 @@
         },
         {
             "label": "ArduPilot: Start Serial Monitor",
-            "type": "shell",
+            "type": "process",
             "command": "/bin/zsh",
             "args": [
                 "-lc",
-                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && exec python -m serial.tools.miniterm /dev/cu.usbserial-140 115200 --raw"
+                "setopt null_glob; devices=(/dev/cu.usb*); if (( ${#devices[@]} == 0 )); then echo \"No USB serial devices found.\"; exit 1; fi; echo \"Select serial device:\"; select device in \"${devices[@]}\"; do if [[ -n \"$device\" ]]; then echo \"Opening $device at 115200 baud...\"; exec python -m serial.tools.miniterm \"$device\" 115200 --raw; else echo \"Invalid selection.\"; fi; done"
             ],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${workspaceFolder}",
+                "env": {
+                    "IDF_PYTHON_ENV_PATH": "/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env",
+                    "PATH": "/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env/bin:${env:PATH}"
+                }
             },
             "isBackground": true,
             "presentation": {
