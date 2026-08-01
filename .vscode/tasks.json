@@ -2,12 +2,12 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "ArduPilot: Configure ESP32-S3",
+            "label": "ArduPilot: Configure ESP32-S3 Drone",
             "type": "shell",
             "command": "/bin/zsh",
             "args": [
                 "-lc",
-                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && source modules/esp_idf/export.sh && ./waf configure --board=esp32s3devkit --debug"
+                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && source modules/esp_idf/export.sh && ./waf configure --board=esp32s3drone --debug"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -32,7 +32,7 @@
                 "cwd": "${workspaceFolder}"
             },
             "dependsOn": [
-                "ArduPilot: Configure ESP32-S3"
+                "ArduPilot: Configure ESP32-S3 Drone"
             ],
             "dependsOrder": "sequence",
             "group": {
@@ -48,7 +48,7 @@
             "problemMatcher": []
         },
         {
-            "label": "ArduPilot: Flash ESP32-S3",
+            "label": "ArduPilot: Flash ESP32-S3 Drone",
             "type": "shell",
             "command": "/bin/zsh",
             "args": [
@@ -56,7 +56,7 @@
                 "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && python -m esptool --chip esp32s3 --port /dev/cu.usbmodem11301 write_flash @flash_args"
             ],
             "options": {
-                "cwd": "${workspaceFolder}/build/esp32s3devkit/esp-idf_build"
+                "cwd": "${workspaceFolder}/build/esp32s3drone/esp-idf_build"
             },
             "presentation": {
                 "reveal": "always",
@@ -113,10 +113,10 @@
             "problemMatcher": []
         },
         {
-            "label": "ArduPilot: Build and Flash",
+            "label": "ArduPilot: Build and Flash ESP32-S3 Drone",
             "dependsOn": [
                 "ArduPilot: Build Plane",
-                "ArduPilot: Flash ESP32-S3"
+                "ArduPilot: Flash ESP32-S3 Drone"
             ],
             "dependsOrder": "sequence",
             "problemMatcher": []
