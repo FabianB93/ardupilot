@@ -3,15 +3,15 @@
     "VsCodeTaskButtons.tasks": [
         {
             "label": "$(tools) Build",
-            "task": "ArduPilot: Build Plane",
+            "task": "ArduPilot: Build Copter",
             "alignment": "left",
-            "tooltip": "Build ArduPilot Plane"
+            "tooltip": "Build ArduPilot Copter"
         },
         {
             "label": "$(cloud-download) Flash",
-            "task": "ArduPilot: Flash ESP32-S3",
+            "task": "ArduPilot: Flash ESP32-S3 Drone",
             "alignment": "left",
-            "tooltip": "Flash ArduPilot to ESP32-S3"
+            "tooltip": "Flash ArduPilot to ESP32-S3 Drone"
         },
         {
             "label": "$(debug-start) Start OpenOCD",

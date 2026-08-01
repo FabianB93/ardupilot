@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "ArduPilot ESP32-S3 Drone: Debug",
+            "name": "ArduCopter ESP32-S3 Drone: Debug",
             "type": "cppdbg",
             "request": "launch",
 

@@ -1,90 +1,171 @@
 # Moritz Fabian Bruch
+#
+# ArduPilot hardware definition for the custom ESP32-S3 drone board.
+#
+# Initial configuration:
+# - Quadcopter with four brushed motors
+# - BMI088 IMU via I2C
+# - IIS2MDC compass via I2C
+# - BME280 barometer via I2C
+# - RC input on GPIO6
+# - UART0 via CP2102N
+# - WiFi enabled
+#
+# Not enabled in this initial version:
+# - GPS
+# - Camera
+# - nRF24L01
+# - PCA9685 servo outputs
+# - MCP23S08 controlled chip-selects
+# - SD card
+# - Battery fuel gauge
+# - ADC inputs
 
 define HAL_ESP32_BOARD_NAME "esp32s3drone"
 
-# SPI Buses; https://docs.espressif.com/projects/esp-idf/en/v5.3.4/esp32/api-reference/peripherals/spi_master.html
-#            Host      DMA Channel     MOSI        MISO        SCLK
-ESP32_SPIBUS SPI3_HOST SPI_DMA_CH_AUTO GPIO_NUM_36 GPIO_NUM_37 GPIO_NUM_35
 
-# i2c Buses
-#             Port       SDA         SCL          SPEED    INTERNAL SOFT
-ESP32_I2CBUS  I2C_NUM_0  GPIO_NUM_16 GPIO_NUM_15  400*KHZ  true     false
+# ----------------------------------------------------------------------
+# I2C buses
+# ----------------------------------------------------------------------
+#
+# I2C0:
+#   GPIO4 = SDA
+#   GPIO5 = SCL
+#
+# Devices:
+#   BMI088 accelerometer 0x18
+#   BMI088 gyroscope     0x69
+#   IIS2MDC compass      0x1E
+#
+# I2C1:
+#   GPIO39 = SDA
+#   GPIO38 = SCL
+#
+# Devices:
+#   BME280 barometer     0x77
+#   BQ27441 fuel gauge   0x55, not enabled initially
+#
+#             Port       SDA          SCL          Speed     Internal Soft
+ESP32_I2CBUS  I2C_NUM_0  GPIO_NUM_4   GPIO_NUM_5   400*KHZ   true     false
+ESP32_I2CBUS  I2C_NUM_1  GPIO_NUM_39  GPIO_NUM_38  400*KHZ   true     false
 
-# SPI Devices
-#            Name                Bus   Device  ChipSel      Mode LoSpeed HiSpeed
-ESP32_SPIDEV mpu9250             0     0       GPIO_NUM_34  0    2*MHZ   8*MHZ
-# ESP32_SPIDEV bmp280              0     0       GPIO_NUM_46  3    10*MHZ  10*MHZ
 
+# ----------------------------------------------------------------------
+# Inertial sensor
+# ----------------------------------------------------------------------
+#
+# BMI088 consists of two independent I2C devices:
+#   Accelerometer: I2C0, address 0x18
+#   Gyroscope:     I2C0, address 0x69
+#
+# GPIO8 is connected to MPU_INT, but the current ArduPilot BMI088
+# backend uses periodic FIFO reads and does not require this interrupt.
 
-define HAL_ESP32_RMT_RX_PIN_NUMBER GPIO_NUM_14
+IMU BMI088 I2C:0:0x18 I2C:0:0x69 ROTATION_NONE
 
-# ADC is available on lots of pints on the esp32, but adc2 cant co-exist with wifi we choose to allow ADC on :
+define AP_INERTIALSENSOR_BMI088_ENABLED 1
+define INS_MAX_INSTANCES 1
 
-# two different pin numbering schemes, both are ok, but only one at a time:
-ESP32_ADC_PIN ADC_CHANNEL_4       11     1
-ESP32_ADC_PIN ADC_CHANNEL_3       11     2
-ESP32_ADC_PIN ADC_CHANNEL_1       11     3
-ESP32_ADC_PIN ADC_CHANNEL_0       11     4
+define HAL_BMI088_DRDY_PIN GPIO_NUM_8
 
-# ESP32_ADC_PIN ADC_GPIO35_CHANNEL       11     35
-# ESP32_ADC_PIN ADC_GPIO34_CHANNEL       11     34
-# ESP32_ADC_PIN ADC_GPIO39_CHANNEL       11     39
-# ESP32_ADC_PIN ADC_GPIO36_CHANNEL       11     36
+# ----------------------------------------------------------------------
+# Compass
+# ----------------------------------------------------------------------
+#
+# The IIS2MDC is mounted directly on the flight-controller PCB.
+# false means that the compass is not forced to be treated as external.
 
-#-----INS/IMU-----
-IMU Invensense SPI:mpu9250 ROTATION_NONE
-# IMU Invensense SPI:mpu9250 ROTATION_ROLL_180
-define HAL_INS_DEFAULT HAL_INS_MPU9250_SPI
-define INS_MAX_INSTANCES 3  # only here for binary identicality
+COMPASS IIS2MDC I2C:0:0x1E false ROTATION_NONE
 
-#-----COMPASS-----
-COMPASS AK8963:probe_mpu9250 0 ROTATION_NONE
-define AP_COMPASS_AK8963_ENABLED TRUE
+define AP_COMPASS_IIS2MDC_ENABLED 1
 define AP_COMPASS_PROBING_ENABLED 1
 
-# -----BARO-----
-BARO BMP280 I2C:0:0x77
+
+# ----------------------------------------------------------------------
+# Barometer
+# ----------------------------------------------------------------------
+#
+# ArduPilot uses the BMP280 backend for both BMP280 and BME280.
+# The driver explicitly accepts the BME280 chip ID 0x60.
+
+BARO BMP280 I2C:1:0x77
+
+define AP_BARO_BMP280_ENABLED 1
 define HAL_BARO_ALLOW_INIT_NO_BARO 1
 
-# 2 use udp, 1 use tcp...  for udp,client needs to connect as UDPCL in missionplanner etc to 192.168.4.1 port 14550
+
+# ----------------------------------------------------------------------
+# RC input
+# ----------------------------------------------------------------------
+#
+# GPIO6 is physically the GPS_RXD connection, but is currently used
+# as the RC receiver input. GPS is therefore disabled in this version.
+
+define HAL_ESP32_RMT_RX_PIN_NUMBER GPIO_NUM_6
+define HAL_ESP32_RCIN GPIO_NUM_6
+
+
+# ----------------------------------------------------------------------
+# Motor outputs
+# ----------------------------------------------------------------------
+#
+# Output order:
+#   Output 1 = MOT1 = GPIO15
+#   Output 2 = MOT2 = GPIO7
+#   Output 3 = MOT3 = GPIO41
+#   Output 4 = MOT4 = GPIO40
+#
+# These outputs drive the gates of the four brushed-motor MOSFET stages.
+
+ESP32_RCOUT GPIO_NUM_15
+ESP32_RCOUT GPIO_NUM_7
+ESP32_RCOUT GPIO_NUM_41
+ESP32_RCOUT GPIO_NUM_40
+
+
+# ----------------------------------------------------------------------
+# Serial ports
+# ----------------------------------------------------------------------
+#
+# UART0 is connected to the CP2102N USB-to-UART converter.
+#
+# ESP32_SERIAL ordering:
+#   Port, RX, TX
+
+ESP32_SERIAL UART_NUM_0 GPIO_NUM_44 GPIO_NUM_43
+
+# UART1 is deliberately omitted:
+#   GPIO6  would be GPS RX, but is currently used for RC input.
+#   GPIO16 would be GPS TX.
+
+
+# ----------------------------------------------------------------------
+# WiFi
+# ----------------------------------------------------------------------
+#
+# 1 = MAVLink over TCP
+# 2 = MAVLink over UDP
+#
+# This retains the setting from the existing esp32s3devkit definition.
+
 define HAL_ESP32_WIFI 1
 
-#  tip: if u are ok getting mavlink-over-tcp or mavlink-over-udp and want to disable mavlink-over-serial-usb
-# then set ardupilot parameter SERIAL0_PROTOCOL = 0 and reboot.
-#  u also will/may want..
-# LOG_BACKEND_TYPE 1
-# LOG_DISARMED 1
-# SERIAL0_PROTOCOL 0
-
-
 define WIFI_SSID "ardupilot123"
-define WIFI_PWD "ardupilot123"
+define WIFI_PWD  "ardupilot123"
 
-# RCOUT which pins are used?
 
-#-----RCOUT-----
-ESP32_RCOUT GPIO_NUM_11
-ESP32_RCOUT GPIO_NUM_10
-ESP32_RCOUT GPIO_NUM_9
-ESP32_RCOUT GPIO_NUM_8
-ESP32_RCOUT GPIO_NUM_7
-ESP32_RCOUT GPIO_NUM_6
-
-# rcin on what pin?
-define HAL_ESP32_RCIN GPIO_NUM_14
-
-#-----UARTS-----
-#            port        RX           TX
-ESP32_SERIAL  UART_NUM_0  GPIO_NUM_44  GPIO_NUM_43
-ESP32_SERIAL  UART_NUM_1  GPIO_NUM_17  GPIO_NUM_18
+# ----------------------------------------------------------------------
+# Filesystem and logging
+# ----------------------------------------------------------------------
+#
+# The SD card is not enabled because its chip-select is controlled by
+# the MCP23S08 rather than directly by an ESP32-S3 GPIO.
+#
+# HAL_ESP32_SDMMC and HAL_ESP32_SDCARD must therefore not be enabled
+# for this initial configuration.
 
 define HAVE_FILESYSTEM_SUPPORT 1
-
-define HAL_ESP32_SDMMC 1
-define HAL_ESP32_SDCARD 1
 define LOGGER_MAVLINK_SUPPORT 1
 define HAL_OS_POSIX_IO 1
 
-# this becomes the default value for the ardupilot param LOG_BACKEND_TYPE, which most ppl want to be 1, for log-to-flash
-# setting to 2 means log-over-mavlink to a companion computer etc.
 define HAL_LOGGING_BACKENDS_DEFAULT 1

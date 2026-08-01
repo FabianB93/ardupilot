@@ -21,12 +21,12 @@
             "problemMatcher": []
         },
         {
-            "label": "ArduPilot: Build Plane",
+            "label": "ArduPilot: Build Copter",
             "type": "shell",
             "command": "/bin/zsh",
             "args": [
                 "-lc",
-                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && source modules/esp_idf/export.sh && ./waf plane"
+                "export IDF_PYTHON_ENV_PATH=/Users/Fabian/.espressif/python_env/idf5.3_py3.10_env && export PATH=\"$IDF_PYTHON_ENV_PATH/bin:$PATH\" && source modules/esp_idf/export.sh && ./waf copter"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -115,7 +115,7 @@
         {
             "label": "ArduPilot: Build and Flash ESP32-S3 Drone",
             "dependsOn": [
-                "ArduPilot: Build Plane",
+                "ArduPilot: Build Copter",
                 "ArduPilot: Flash ESP32-S3 Drone"
             ],
             "dependsOrder": "sequence",
