@@ -1,0 +1,7 @@
+# Default parameters for ESP32-S3 Drone
+
+SCHED_LOOP_RATE,150
+
+# Enable Fast Rate Controller
+FSTRATE_ENABLE,1
+FSTRATE_DIV,2

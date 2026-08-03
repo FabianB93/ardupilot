@@ -216,13 +216,32 @@ void IRAM_ATTR Scheduler::delay(uint16_t ms)
 
 void IRAM_ATTR Scheduler::delay_microseconds(uint16_t us)
 {
-    if (in_main_thread() && us < 100) {
-        esp_rom_delay_us(us);
-    } else { // Minimum delay for FreeRTOS is 1ms
-        uint32_t tick = portTICK_PERIOD_MS * 1000;
-
-        vTaskDelay((us+tick-1)/tick);
+    if (us == 0) {
+        taskYIELD();
+        return;
     }
+
+    /*
+     * Only the ArduPilot main thread needs a precise sub-millisecond
+     * delay. Background tasks must block through FreeRTOS so they release
+     * their CPU core instead of busy-waiting continuously.
+     */
+    if (in_main_thread() && us < 1000U) {
+        esp_rom_delay_us(us);
+        return;
+    }
+
+    const uint32_t tick_us =
+        portTICK_PERIOD_MS * 1000U;
+
+    const TickType_t delay_ticks =
+        static_cast<TickType_t>(
+            MAX(
+                1U,
+                static_cast<uint32_t>(
+                    (us + tick_us - 1U) / tick_us)));
+
+    vTaskDelay(delay_ticks);
 }
 
 void IRAM_ATTR Scheduler::register_timer_process(AP_HAL::MemberProc proc)
@@ -556,15 +575,38 @@ void IRAM_ATTR Scheduler::_main_thread(void *arg)
 
     sched->set_system_initialized();
 
-    //initialize WTD for current thread on FASTCPU, all cores will be (1 << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1
-    wdt_init( TWDT_TIMEOUT_MS, 1 << FASTCPU ); // 3 sec
+    /*
+     * Monitor APM_MAIN explicitly, but do not subscribe the CPU0 idle
+     * task to the task watchdog. APM_MAIN uses a precise sub-millisecond
+     * delay and can intentionally keep CPU0 busy, while still resetting
+     * its own watchdog subscription on every loop iteration.
+     */
+    wdt_init(TWDT_TIMEOUT_MS, 0);
 
 
 #ifdef SCHEDDEBUG
     printf("%s:%d initialised\n", __PRETTY_FUNCTION__, __LINE__);
 #endif
+    uint32_t profile_last_report_ms = AP_HAL::millis();
+    uint64_t profile_total_loop_us = 0;
+    uint32_t profile_max_loop_us = 0;
+    uint32_t profile_loop_count = 0;
+
     while (true) {
+        const uint32_t loop_start_us = AP_HAL::micros();
+
         sched->callbacks->loop();
+
+        const uint32_t callback_duration_us =
+            AP_HAL::micros() - loop_start_us;
+
+        profile_total_loop_us += callback_duration_us;
+        profile_loop_count++;
+
+        if (callback_duration_us > profile_max_loop_us) {
+            profile_max_loop_us = callback_duration_us;
+        }
+
         sched->delay_microseconds(250);
 
         // run stats periodically
@@ -573,9 +615,30 @@ void IRAM_ATTR Scheduler::_main_thread(void *arg)
 #endif
         sched->print_main_loop_rate();
 
+        const uint32_t now_ms = AP_HAL::millis();
+        if (now_ms - profile_last_report_ms >= 5000U) {
+            const uint32_t average_loop_us =
+                profile_loop_count > 0
+                    ? static_cast<uint32_t>(
+                          profile_total_loop_us / profile_loop_count)
+                    : 0U;
+
+            hal.console->printf(
+                "APM_MAIN profile: callbacks avg=%luus max=%luus "
+                "count=%lu/5s\n",
+                (unsigned long)average_loop_us,
+                (unsigned long)profile_max_loop_us,
+                (unsigned long)profile_loop_count);
+
+            profile_last_report_ms = now_ms;
+            profile_total_loop_us = 0;
+            profile_max_loop_us = 0;
+            profile_loop_count = 0;
+        }
+
         if (ESP_OK != esp_task_wdt_reset()) {
             printf("esp_task_wdt_reset() failed\n");
-        };
+        }
     }
 }
 

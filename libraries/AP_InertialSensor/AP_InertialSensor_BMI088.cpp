@@ -43,7 +43,7 @@
 #define REGA_FIFO_LEN1     0x25
 
 #define REGG_CHIPID        0x00
-#define REGA_RATE_X_LSB    0x02
+#define REGG_RATE_X_LSB    0x02
 #define REGG_INT_STATUS_1  0x0A
 #define REGG_INT_STATUS_2  0x0B
 #define REGG_INT_STATUS_3  0x0C
@@ -56,13 +56,43 @@
 #define REGG_FIFO_CONFIG_1 0x3E
 #define REGG_FIFO_DATA     0x3F
 
-#define ACCEL_BACKEND_SAMPLE_RATE   1600
-#define GYRO_BACKEND_SAMPLE_RATE    2000
+#define ACCEL_BACKEND_SAMPLE_RATE   400
+#define GYRO_BACKEND_SAMPLE_RATE    1000
 
-const uint32_t ACCEL_BACKEND_PERIOD_US = 1000000UL / ACCEL_BACKEND_SAMPLE_RATE;
-const uint32_t GYRO_BACKEND_PERIOD_US = 1000000UL / GYRO_BACKEND_SAMPLE_RATE;
+/*
+ * Accelerometer and gyroscope FIFOs are both serviced at 400 Hz.
+ *
+ * At the configured sensor ODRs this produces approximately:
+ *
+ *   accelerometer: 400 Hz / 400 Hz = 1 frame per callback
+ *   gyroscope:    1000 Hz / 400 Hz = 2.5 frames per callback
+ *
+ * The accelerometer callback now matches the 400 Hz ArduCopter main loop.
+ * A limit of two accel frames allows short scheduling delays to be caught
+ * up without processing an unnecessarily large FIFO batch.
+ */
+static constexpr uint32_t ACCEL_BACKEND_PERIOD_US = 2500;
+static constexpr uint32_t GYRO_BACKEND_PERIOD_US = 2500;
+
+static constexpr uint8_t BMI088_MAX_ACCEL_FRAMES_PER_CALLBACK = 2;
+static constexpr uint8_t BMI088_MAX_GYRO_FRAMES_PER_CALLBACK = 6;
+
 
 extern const AP_HAL::HAL& hal;
+
+/*
+ * BMI088 gyroscope diagnostics.
+ *
+ * The counters are cumulative and are written only by the DeviceBus
+ * thread. update() reads snapshots every five seconds and calculates
+ * deltas, so no counter reset races with the bus thread.
+ */
+static volatile uint32_t bmi088_gyro_callback_count = 0;
+static volatile uint32_t bmi088_gyro_frame_count = 0;
+static volatile uint32_t bmi088_gyro_empty_count = 0;
+static volatile uint32_t bmi088_gyro_overrun_count = 0;
+static volatile uint32_t bmi088_gyro_error_count = 0;
+
 
 AP_InertialSensor_BMI088::AP_InertialSensor_BMI088(AP_InertialSensor &imu,
                                                    AP_HAL::OwnPtr<AP_HAL::Device> _dev_accel,
@@ -125,8 +155,8 @@ bool AP_InertialSensor_BMI088::read_accel_registers(uint8_t reg, uint8_t *data, 
     if (dev_accel->bus_type() != AP_HAL::Device::BUS_TYPE_SPI) {
         return dev_accel->read_registers(reg, data, len);
     }
-    // for SPI we need to discard the first returned byte. See
-    // datasheet for explanation
+
+    // for SPI we need to discard the first returned byte
     uint8_t b[len+2];
     b[0] = reg | 0x80;
     memset(&b[1], 0, len+1);
@@ -157,8 +187,8 @@ static const struct {
     uint8_t reg;
     uint8_t value;
 } accel_config[] = {
-    // OSR2 gives 234Hz LPF @ 1.6Khz ODR
-    { REGA_CONF, 0x9C },
+    // OSR2 with 400 Hz output data rate
+    { REGA_CONF, 0x9A },
     // setup 24g range (16g for BMI085)
     { REGA_RANGE, 0x03 },
     // disable low-power mode
@@ -227,6 +257,9 @@ bool AP_InertialSensor_BMI088::accel_init()
         DEV_PRINTF("BMI08x: delaying accel config\n");
     }
 
+    // Bound runtime retries to avoid long I2C bus-thread stalls.
+    dev_accel->set_retries(2);
+
     DEV_PRINTF("BMI08x: found accel\n");
 
     return true;
@@ -244,22 +277,27 @@ bool AP_InertialSensor_BMI088::gyro_init()
         return false;
     }
 
-    /* Soft-reset gyro
-        Return value of 'write_register()' is not checked.
-        This commands has the tendency to fail upon soft-reset.
-    */
+    /*
+     * The gyro stops acknowledging while the soft reset is executed.
+     * Use one transfer attempt so this expected behaviour cannot block
+     * the I2C bus thread for tens of milliseconds.
+     */
+    dev_gyro->set_retries(1);
     dev_gyro->write_register(REGG_BGW_SOFTRESET, 0xB6);
     hal.scheduler->delay(30);
 
+    // Keep runtime retries bounded so a transient I2C error cannot starve APM_MAIN.
+    dev_gyro->set_retries(2);
+
     dev_gyro->setup_checked_registers(5, 20);
-    
+
     // setup 2000dps range
     if (!dev_gyro->write_register(REGG_RANGE, 0x00, true)) {
         return false;
     }
 
-    // setup filter bandwidth 532Hz, no decimation
-    if (!dev_gyro->write_register(REGG_BW, 0x80, true)) {
+    // setup 1000 Hz ODR with 116 Hz filter bandwidth
+    if (!dev_gyro->write_register(REGG_BW, 0x02, true)) {
         return false;
     }
 
@@ -278,15 +316,24 @@ bool AP_InertialSensor_BMI088::gyro_init()
         return false;
     }
 
-    DEV_PRINTF("BMI088: found gyro\n");    
+    DEV_PRINTF("BMI088: found gyro\n");
 
     return true;
 }
 
 bool AP_InertialSensor_BMI088::init()
 {
-    dev_accel->set_read_flag(0x80);
-    dev_gyro->set_read_flag(0x80);
+    /*
+     * The 0x80 register read flag is required for SPI only. I2C register
+     * addresses must remain unchanged.
+     */
+    if (dev_accel->bus_type() == AP_HAL::Device::BUS_TYPE_SPI) {
+        dev_accel->set_read_flag(0x80);
+    }
+
+    if (dev_gyro->bus_type() == AP_HAL::Device::BUS_TYPE_SPI) {
+        dev_gyro->set_read_flag(0x80);
+    }
 
     return accel_init() && gyro_init();
 }
@@ -299,90 +346,95 @@ void AP_InertialSensor_BMI088::read_fifo_accel(void)
     if (!setup_accel_config()) {
         return;
     }
+
     uint8_t len[2];
     if (!read_accel_registers(REGA_FIFO_LEN0, len, 2)) {
         _inc_accel_error_count(accel_instance);
         return;
     }
-    uint16_t fifo_length = len[0] + (len[1]<<8);
+
+    uint16_t fifo_length = len[0] + (len[1] << 8);
     if (fifo_length & 0x8000) {
         // empty
         return;
     }
 
-    // don't read more than 8 frames at a time
-    if (fifo_length > 8*7) {
-        fifo_length = 8*7;
+    const uint16_t max_fifo_length =
+        BMI088_MAX_ACCEL_FRAMES_PER_CALLBACK * 7U;
+    if (fifo_length > max_fifo_length) {
+        fifo_length = max_fifo_length;
     }
     if (fifo_length == 0) {
         return;
     }
-    
-    // adjust the periodic callback to be synchronous with the incoming data
-    // this means that we rarely run read_fifo_accel() without updating the sensor data
-    dev_accel->adjust_periodic_callback(accel_periodic_handle, ACCEL_BACKEND_PERIOD_US);
 
-    uint8_t data[fifo_length];
+    uint8_t data[max_fifo_length];
     if (!read_accel_registers(REGA_FIFO_DATA, data, fifo_length)) {
         _inc_accel_error_count(accel_instance);
         return;
     }
 
-    // use new accel_range depending on sensor type
-    const float scale = (1.0/32768.0) * GRAVITY_MSS * accel_range;
-    const uint8_t *p = &data[0];
-    while (fifo_length >= 7) {
-        /*
-          the fifo frames are variable length, with the frame type in the first byte
-         */
+    const float scale =
+        (1.0f / 32768.0f) * GRAVITY_MSS * accel_range;
+    const uint8_t *p = data;
+    uint16_t remaining = fifo_length;
+
+    while (remaining >= 7) {
         uint8_t frame_len = 2;
+
         switch (p[0] & 0xFC) {
         case 0x84: {
-            // accel frame
             frame_len = 7;
-            const uint8_t *d = p+1;
+            const uint8_t *d = p + 1;
             int16_t xyz[3] {
-                int16_t(uint16_t(d[0] | (d[1]<<8))),
-                int16_t(uint16_t(d[2] | (d[3]<<8))),
-                int16_t(uint16_t(d[4] | (d[5]<<8)))};
-            Vector3f accel(xyz[0], xyz[1], xyz[2]);
+                int16_t(uint16_t(d[0] | (d[1] << 8))),
+                int16_t(uint16_t(d[2] | (d[3] << 8))),
+                int16_t(uint16_t(d[4] | (d[5] << 8)))
+            };
 
+            Vector3f accel(xyz[0], xyz[1], xyz[2]);
             accel *= scale;
 
             _rotate_and_correct_accel(accel_instance, accel);
             _notify_new_accel_raw_sample(accel_instance, accel);
             break;
         }
+
         case 0x40:
-            // skip frame
             frame_len = 2;
             break;
+
         case 0x44:
-            // sensortime frame
             frame_len = 4;
             break;
+
         case 0x48:
-            // fifo config frame
-            frame_len = 2;
-            break;
         case 0x50:
-            // sample drop frame
             frame_len = 2;
             break;
         }
+
+        if (frame_len > remaining) {
+            break;
+        }
+
         p += frame_len;
-        fifo_length -= frame_len;
+        remaining -= frame_len;
     }
 
     if (temperature_counter++ == 100) {
         temperature_counter = 0;
+
         uint8_t tbuf[2];
         if (!read_accel_registers(REGA_TEMP_MSB, tbuf, 2)) {
             _inc_accel_error_count(accel_instance);
         } else {
-            uint16_t temp_uint11 = (tbuf[0]<<3) | (tbuf[1]>>5);
-            int16_t temp_int11 = temp_uint11>1023?temp_uint11-2048:temp_uint11;
-            float temp_degc = temp_int11 * 0.125f + 23;
+            const uint16_t temp_uint11 =
+                (tbuf[0] << 3) | (tbuf[1] >> 5);
+            const int16_t temp_int11 =
+                temp_uint11 > 1023 ? temp_uint11 - 2048 : temp_uint11;
+            const float temp_degc =
+                temp_int11 * 0.125f + 23.0f;
             _publish_temperature(accel_instance, temp_degc);
         }
     }
@@ -393,44 +445,55 @@ void AP_InertialSensor_BMI088::read_fifo_accel(void)
  */
 void AP_InertialSensor_BMI088::read_fifo_gyro(void)
 {
+    bmi088_gyro_callback_count++;
+
     uint8_t num_frames;
     if (!dev_gyro->read_registers(REGG_FIFO_STATUS, &num_frames, 1)) {
+        bmi088_gyro_error_count++;
         _inc_gyro_error_count(gyro_instance);
         return;
     }
+
     const float scale = radians(2000.0f) / 32767.0f;
-    const uint8_t max_frames = 8;
-    const Vector3i bad_frame{INT16_MIN,INT16_MIN,INT16_MIN};
+    const uint8_t max_frames =
+        BMI088_MAX_GYRO_FRAMES_PER_CALLBACK;
+    const Vector3i bad_frame{INT16_MIN, INT16_MIN, INT16_MIN};
     Vector3i data[max_frames];
 
     if (num_frames & 0x80) {
         // fifo overrun, reset, likely caused by scheduling error
-        dev_gyro->write_register(REGG_FIFO_CONFIG_1, 0x40, true);
+        bmi088_gyro_overrun_count++;
+
+        if (!dev_gyro->write_register(REGG_FIFO_CONFIG_1, 0x40, true)) {
+            bmi088_gyro_error_count++;
+        }
         goto check_next;
     }
 
     num_frames &= 0x7F;
-    
-    // don't read more than 8 frames at a time
     num_frames = MIN(num_frames, max_frames);
+
     if (num_frames == 0) {
+        bmi088_gyro_empty_count++;
         goto check_next;
     }
 
-    // adjust the periodic callback to be synchronous with the incoming data
-    // this means that we rarely run read_fifo_gyro() without updating the sensor data
-    dev_gyro->adjust_periodic_callback(gyro_periodic_handle, GYRO_BACKEND_PERIOD_US);
-
-    if (!dev_gyro->read_registers(REGG_FIFO_DATA, (uint8_t *)data, num_frames*6)) {
+    if (!dev_gyro->read_registers(
+            REGG_FIFO_DATA,
+            reinterpret_cast<uint8_t *>(data),
+            num_frames * 6U)) {
+        bmi088_gyro_error_count++;
         _inc_gyro_error_count(gyro_instance);
         goto check_next;
     }
 
-    // data is 16 bits with 2000dps range
+    bmi088_gyro_frame_count += num_frames;
+
     for (uint8_t i = 0; i < num_frames; i++) {
         if (data[i] == bad_frame) {
             continue;
         }
+
         Vector3f gyro(data[i].x, data[i].y, data[i].z);
         gyro *= scale;
 
@@ -441,6 +504,7 @@ void AP_InertialSensor_BMI088::read_fifo_gyro(void)
 check_next:
     AP_HAL::Device::checkreg reg;
     if (!dev_gyro->check_next_register(reg)) {
+        bmi088_gyro_error_count++;
         log_register_change(dev_gyro->get_bus_id(), reg);
         _inc_gyro_error_count(gyro_instance);
     }
@@ -450,5 +514,64 @@ bool AP_InertialSensor_BMI088::update()
 {
     update_accel(accel_instance);
     update_gyro(gyro_instance);
+
+    /*
+     * Print one compact diagnostic line every five seconds. Reporting
+     * occurs in the main thread, never in the I2C DeviceBus callback.
+     */
+    static uint32_t last_report_ms = 0;
+    static uint32_t last_callback_count = 0;
+    static uint32_t last_frame_count = 0;
+    static uint32_t last_empty_count = 0;
+    static uint32_t last_overrun_count = 0;
+    static uint32_t last_error_count = 0;
+
+    const uint32_t now_ms = AP_HAL::millis();
+
+    if (now_ms - last_report_ms >= 5000U) {
+        const uint32_t elapsed_ms =
+            last_report_ms == 0 ? 5000U : now_ms - last_report_ms;
+        last_report_ms = now_ms;
+
+        const uint32_t callback_count = bmi088_gyro_callback_count;
+        const uint32_t frame_count = bmi088_gyro_frame_count;
+        const uint32_t empty_count = bmi088_gyro_empty_count;
+        const uint32_t overrun_count = bmi088_gyro_overrun_count;
+        const uint32_t error_count = bmi088_gyro_error_count;
+
+        const uint32_t callback_delta =
+            callback_count - last_callback_count;
+        const uint32_t frame_delta =
+            frame_count - last_frame_count;
+        const uint32_t empty_delta =
+            empty_count - last_empty_count;
+        const uint32_t overrun_delta =
+            overrun_count - last_overrun_count;
+        const uint32_t error_delta =
+            error_count - last_error_count;
+
+        last_callback_count = callback_count;
+        last_frame_count = frame_count;
+        last_empty_count = empty_count;
+        last_overrun_count = overrun_count;
+        last_error_count = error_count;
+
+        const uint32_t callbacks_per_second =
+            (callback_delta * 1000U) / elapsed_ms;
+        const uint32_t frames_per_second =
+            (frame_delta * 1000U) / elapsed_ms;
+        const uint32_t empty_per_second =
+            (empty_delta * 1000U) / elapsed_ms;
+
+        hal.console->printf(
+            "BMI088 gyro: cb=%lu/s frames=%lu/s empty=%lu/s "
+            "overrun=%lu errors=%lu\n",
+            (unsigned long)callbacks_per_second,
+            (unsigned long)frames_per_second,
+            (unsigned long)empty_per_second,
+            (unsigned long)overrun_delta,
+            (unsigned long)error_delta);
+    }
+
     return true;
 }

@@ -264,6 +264,27 @@ void Copter::rate_controller_thread()
         // there is no need to output to the motors more than once for every batch of samples
         attitude_control->rate_controller_run_dt(gyro + ahrs.get_gyro_drift(), sensor_dt);
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+        static uint32_t fast_rate_counter = 0;
+        static uint32_t fast_rate_last_report_ms = 0;
+
+        fast_rate_counter++;
+
+        const uint32_t fast_rate_report_ms = AP_HAL::millis();
+
+        if (fast_rate_report_ms - fast_rate_last_report_ms >= 1000U) {
+            hal.console->printf(
+                "FAST RATE: %lu Hz decimation=%u sensor_dt=%.6f using=%u\n",
+                (unsigned long)fast_rate_counter,
+                (unsigned)rate_decimation,
+                (double)sensor_dt,
+                (unsigned)using_rate_thread);
+
+            fast_rate_counter = 0;
+            fast_rate_last_report_ms = fast_rate_report_ms;
+        }
+#endif
+
 #ifdef RATE_LOOP_TIMING_DEBUG
         rate_controller_time_us += AP_HAL::micros() - rate_now_us;
         rate_now_us = AP_HAL::micros();

@@ -583,19 +583,87 @@ void AP_AHRS::update_reset_counters()
 // update run at loop rate
 void AP_AHRS::update(bool skip_ins_update)
 {
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    static uint32_t profile_last_report_ms = AP_HAL::millis();
+
+    static uint64_t profile_total_us = 0;
+    static uint64_t profile_orientation_us = 0;
+    static uint64_t profile_ins_us = 0;
+    static uint64_t profile_locked_preamble_us = 0;
+    static uint64_t profile_configured_backend_us = 0;
+    static uint64_t profile_other_backends_us = 0;
+    static uint64_t profile_other_backend_total_us[AP_AHRS_BACKEND_COUNT] {};
+    static uint32_t profile_other_backend_max_us[AP_AHRS_BACKEND_COUNT] {};
+    static uint32_t profile_other_backend_count[AP_AHRS_BACKEND_COUNT] {};
+    static const char *profile_other_backend_name[AP_AHRS_BACKEND_COUNT] {};
+    static uint64_t profile_backend_selection_us = 0;
+    static uint64_t profile_notify_us = 0;
+    static uint64_t profile_reset_counters_us = 0;
+    static uint64_t profile_state_us = 0;
+    static uint64_t profile_module_hook_us = 0;
+    static uint64_t profile_optflow_us = 0;
+    static uint64_t profile_view_us = 0;
+    static uint64_t profile_aoa_ssa_us = 0;
+
+    static uint32_t profile_total_max_us = 0;
+    static uint32_t profile_orientation_max_us = 0;
+    static uint32_t profile_ins_max_us = 0;
+    static uint32_t profile_locked_preamble_max_us = 0;
+    static uint32_t profile_configured_backend_max_us = 0;
+    static uint32_t profile_other_backends_max_us = 0;
+    static uint32_t profile_backend_selection_max_us = 0;
+    static uint32_t profile_notify_max_us = 0;
+    static uint32_t profile_reset_counters_max_us = 0;
+    static uint32_t profile_state_max_us = 0;
+    static uint32_t profile_module_hook_max_us = 0;
+    static uint32_t profile_optflow_max_us = 0;
+    static uint32_t profile_view_max_us = 0;
+    static uint32_t profile_aoa_ssa_max_us = 0;
+
+    static uint32_t profile_count = 0;
+
+    const uint32_t profile_total_start_us = AP_HAL::micros();
+    uint32_t profile_section_start_us;
+    uint32_t profile_section_duration_us;
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
     // periodically checks to see if we should update the AHRS
     // orientation (e.g. based on the AHRS_ORIENTATION parameter)
     // allow for runtime change of orientation
     // this makes initial config easier
     update_orientation();
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_orientation_us += profile_section_duration_us;
+    profile_orientation_max_us =
+        MAX(profile_orientation_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
     if (!skip_ins_update) {
         // tell the IMU to grab some data
         AP::ins().update();
     }
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_ins_us += profile_section_duration_us;
+    profile_ins_max_us =
+        MAX(profile_ins_max_us, profile_section_duration_us);
+#endif
+
     // support locked access functions to AHRS data
     WITH_SEMAPHORE(_rsem);
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_start_us = AP_HAL::micros();
+#endif
 
     // see if we have to restore home after a watchdog reset:
     if (!_checked_watchdog_home) {
@@ -613,6 +681,16 @@ void AP_AHRS::update(bool skip_ins_update)
     // update takeoff/touchdown flags
     update_flags();
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_locked_preamble_us += profile_section_duration_us;
+    profile_locked_preamble_max_us =
+        MAX(profile_locked_preamble_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
     // update the backends, configured-first.  Some backends look at
     // loop-time-remaining and opt-out of their full update if there
     // isn't enough time left.  Copy back their results while we are
@@ -623,24 +701,95 @@ void AP_AHRS::update(bool skip_ins_update)
     // if we don't have an origin, maybe set one:
     try_set_common_origin(*configured_backend, *configured_estimates);
 
-    for (auto &backend_and_estimates : backends_and_estimates) {
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_configured_backend_us += profile_section_duration_us;
+    profile_configured_backend_max_us =
+        MAX(profile_configured_backend_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
+    for (uint8_t backend_index = 0;
+         backend_index < AP_AHRS_BACKEND_COUNT;
+         backend_index++) {
+        auto &backend_and_estimates =
+            backends_and_estimates[backend_index];
+
         if (&backend_and_estimates.backend == configured_backend) {
             // already updated
             continue;
         }
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+        const uint32_t profile_backend_start_us =
+            AP_HAL::micros();
+#endif
+
         backend_and_estimates.backend.update();
         backend_and_estimates.estimates = {};
-        backend_and_estimates.backend.get_results(backend_and_estimates.estimates);
+        backend_and_estimates.backend.get_results(
+            backend_and_estimates.estimates);
+
         // if we don't have an origin, maybe set one:
-        try_set_common_origin(backend_and_estimates.backend, backend_and_estimates.estimates);
+        try_set_common_origin(
+            backend_and_estimates.backend,
+            backend_and_estimates.estimates);
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+        const uint32_t profile_backend_duration_us =
+            AP_HAL::micros() - profile_backend_start_us;
+
+        profile_other_backend_total_us[backend_index] +=
+            profile_backend_duration_us;
+        profile_other_backend_count[backend_index]++;
+        profile_other_backend_name[backend_index] =
+            backend_and_estimates.backend.shortname();
+
+        profile_other_backend_max_us[backend_index] =
+            MAX(
+                profile_other_backend_max_us[backend_index],
+                profile_backend_duration_us);
+#endif
     }
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_other_backends_us += profile_section_duration_us;
+    profile_other_backends_max_us =
+        MAX(profile_other_backends_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
 
     update_configured_ekf_type();
     update_active_EKF_type();
     update_secondary_backend_pointers();
 
-    // update blinking lights, buzzer etc bsaed on active EKF type:
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_backend_selection_us += profile_section_duration_us;
+    profile_backend_selection_max_us =
+        MAX(profile_backend_selection_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
+    // update blinking lights, buzzer etc based on active EKF type:
     update_notify_from_filter_status(active_estimates->filter_status);
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_notify_us += profile_section_duration_us;
+    profile_notify_max_us =
+        MAX(profile_notify_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
 
     // update result reset counters.  Note that this *must* be called
     // before assignment of state.active_EKF_type to
@@ -653,12 +802,42 @@ void AP_AHRS::update(bool skip_ins_update)
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "AHRS: %s active", active_backend->shortname());
     }
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_reset_counters_us += profile_section_duration_us;
+    profile_reset_counters_max_us =
+        MAX(profile_reset_counters_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
     // update published state, including copying state from the active backend:
     update_state();
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_state_us += profile_section_duration_us;
+    profile_state_max_us =
+        MAX(profile_state_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
 
 #if AP_MODULE_SUPPORTED
     // call AHRS_update hook if any
     AP_Module::call_hook_AHRS_update(*this);
+#endif
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_module_hook_us += profile_section_duration_us;
+    profile_module_hook_max_us =
+        MAX(profile_module_hook_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
 #endif
 
     // push gyros if optical flow present
@@ -667,13 +846,41 @@ void AP_AHRS::update(bool skip_ins_update)
         hal.opticalflow->push_gyro_bias(exported_gyro_bias.x, exported_gyro_bias.y);
     }
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_optflow_us += profile_section_duration_us;
+    profile_optflow_max_us =
+        MAX(profile_optflow_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
     if (_view != nullptr) {
         // update optional alternative attitude view
         _view->update();
     }
 
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_view_us += profile_section_duration_us;
+    profile_view_max_us =
+        MAX(profile_view_max_us, profile_section_duration_us);
+
+    profile_section_start_us = AP_HAL::micros();
+#endif
+
     // update AOA and SSA
     update_AOA_SSA();
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    profile_section_duration_us =
+        AP_HAL::micros() - profile_section_start_us;
+    profile_aoa_ssa_us += profile_section_duration_us;
+    profile_aoa_ssa_max_us =
+        MAX(profile_aoa_ssa_max_us, profile_section_duration_us);
+#endif
 
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
     /*
@@ -682,6 +889,141 @@ void AP_AHRS::update(bool skip_ins_update)
     const auto *sitl = AP::sitl();
     if (sitl->loop_time_jitter_us > 0) {
         hal.scheduler->delay_microseconds(random() % sitl->loop_time_jitter_us);
+    }
+#endif
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    const uint32_t profile_total_duration_us =
+        AP_HAL::micros() - profile_total_start_us;
+
+    profile_total_us += profile_total_duration_us;
+    profile_total_max_us =
+        MAX(profile_total_max_us, profile_total_duration_us);
+    profile_count++;
+
+    const uint32_t profile_now_ms = AP_HAL::millis();
+
+    if (profile_now_ms - profile_last_report_ms >= 5000U) {
+        const uint32_t count = MAX(profile_count, 1U);
+
+        hal.console->printf(
+            "AHRS profile avg/max us: "
+            "total=%lu/%lu orient=%lu/%lu ins=%lu/%lu "
+            "pre=%lu/%lu cfg=%lu/%lu other=%lu/%lu "
+            "select=%lu/%lu notify=%lu/%lu reset=%lu/%lu "
+            "state=%lu/%lu module=%lu/%lu optflow=%lu/%lu "
+            "view=%lu/%lu aoa=%lu/%lu count=%lu/5s\n",
+            (unsigned long)(profile_total_us / count),
+            (unsigned long)profile_total_max_us,
+            (unsigned long)(profile_orientation_us / count),
+            (unsigned long)profile_orientation_max_us,
+            (unsigned long)(profile_ins_us / count),
+            (unsigned long)profile_ins_max_us,
+            (unsigned long)(profile_locked_preamble_us / count),
+            (unsigned long)profile_locked_preamble_max_us,
+            (unsigned long)(profile_configured_backend_us / count),
+            (unsigned long)profile_configured_backend_max_us,
+            (unsigned long)(profile_other_backends_us / count),
+            (unsigned long)profile_other_backends_max_us,
+            (unsigned long)(profile_backend_selection_us / count),
+            (unsigned long)profile_backend_selection_max_us,
+            (unsigned long)(profile_notify_us / count),
+            (unsigned long)profile_notify_max_us,
+            (unsigned long)(profile_reset_counters_us / count),
+            (unsigned long)profile_reset_counters_max_us,
+            (unsigned long)(profile_state_us / count),
+            (unsigned long)profile_state_max_us,
+            (unsigned long)(profile_module_hook_us / count),
+            (unsigned long)profile_module_hook_max_us,
+            (unsigned long)(profile_optflow_us / count),
+            (unsigned long)profile_optflow_max_us,
+            (unsigned long)(profile_view_us / count),
+            (unsigned long)profile_view_max_us,
+            (unsigned long)(profile_aoa_ssa_us / count),
+            (unsigned long)profile_aoa_ssa_max_us,
+            (unsigned long)profile_count);
+
+        hal.console->printf(
+            "AHRS backends: configured=%s active=%s count=%u\n",
+            configured_backend != nullptr
+                ? configured_backend->shortname()
+                : "<null>",
+            active_backend != nullptr
+                ? active_backend->shortname()
+                : "<null>",
+            (unsigned)AP_AHRS_BACKEND_COUNT);
+
+        for (uint8_t backend_index = 0;
+             backend_index < AP_AHRS_BACKEND_COUNT;
+             backend_index++) {
+            if (profile_other_backend_count[backend_index] == 0) {
+                continue;
+            }
+
+            const uint32_t backend_avg_us =
+                static_cast<uint32_t>(
+                    profile_other_backend_total_us[backend_index] /
+                    profile_other_backend_count[backend_index]);
+
+            hal.console->printf(
+                "AHRS secondary[%u] %s: calls=%lu avg=%luus "
+                "max=%luus total=%lluus\n",
+                (unsigned)backend_index,
+                profile_other_backend_name[backend_index] != nullptr
+                    ? profile_other_backend_name[backend_index]
+                    : "<unnamed>",
+                (unsigned long)
+                    profile_other_backend_count[backend_index],
+                (unsigned long)backend_avg_us,
+                (unsigned long)
+                    profile_other_backend_max_us[backend_index],
+                (unsigned long long)
+                    profile_other_backend_total_us[backend_index]);
+        }
+
+        profile_last_report_ms = profile_now_ms;
+
+        profile_total_us = 0;
+        profile_orientation_us = 0;
+        profile_ins_us = 0;
+        profile_locked_preamble_us = 0;
+        profile_configured_backend_us = 0;
+        profile_other_backends_us = 0;
+
+        for (uint8_t backend_index = 0;
+             backend_index < AP_AHRS_BACKEND_COUNT;
+             backend_index++) {
+            profile_other_backend_total_us[backend_index] = 0;
+            profile_other_backend_max_us[backend_index] = 0;
+            profile_other_backend_count[backend_index] = 0;
+            profile_other_backend_name[backend_index] = nullptr;
+        }
+
+        profile_backend_selection_us = 0;
+        profile_notify_us = 0;
+        profile_reset_counters_us = 0;
+        profile_state_us = 0;
+        profile_module_hook_us = 0;
+        profile_optflow_us = 0;
+        profile_view_us = 0;
+        profile_aoa_ssa_us = 0;
+
+        profile_total_max_us = 0;
+        profile_orientation_max_us = 0;
+        profile_ins_max_us = 0;
+        profile_locked_preamble_max_us = 0;
+        profile_configured_backend_max_us = 0;
+        profile_other_backends_max_us = 0;
+        profile_backend_selection_max_us = 0;
+        profile_notify_max_us = 0;
+        profile_reset_counters_max_us = 0;
+        profile_state_max_us = 0;
+        profile_module_hook_max_us = 0;
+        profile_optflow_max_us = 0;
+        profile_view_max_us = 0;
+        profile_aoa_ssa_max_us = 0;
+
+        profile_count = 0;
     }
 #endif
 }

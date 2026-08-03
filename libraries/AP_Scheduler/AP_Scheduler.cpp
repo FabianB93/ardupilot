@@ -50,6 +50,25 @@
 
 extern const AP_HAL::HAL& hal;
 
+/*
+ * Temporary scheduler task profiling for the ESP32-S3 investigation.
+ *
+ * Statistics are accumulated per scheduler task and the 20 tasks with
+ * the highest total execution time are printed every five seconds.
+ * Keeping the report bounded avoids flooding the serial link and
+ * materially changing the timing being measured.
+ */
+static constexpr uint16_t SCHED_PROFILE_MAX_TASKS = 256;
+static constexpr uint8_t SCHED_PROFILE_TOP_TASKS = 20;
+static constexpr uint32_t SCHED_PROFILE_REPORT_PERIOD_MS = 5000;
+
+static uint64_t sched_profile_total_us[SCHED_PROFILE_MAX_TASKS] {};
+static uint32_t sched_profile_max_us[SCHED_PROFILE_MAX_TASKS] {};
+static uint32_t sched_profile_count[SCHED_PROFILE_MAX_TASKS] {};
+static const char *sched_profile_name[SCHED_PROFILE_MAX_TASKS] {};
+static uint32_t sched_profile_last_report_ms = 0;
+
+
 const AP_Param::GroupInfo AP_Scheduler::var_info[] = {
     // @Param: DEBUG
     // @DisplayName: Scheduler debug level
@@ -277,6 +296,20 @@ void AP_Scheduler::run(uint32_t time_available)
         // work out how long the event actually took
         now = AP_HAL::micros();
         uint32_t time_taken = now - _task_time_started;
+
+        /*
+         * Accumulate per-task runtime statistics. Task indexes are stable
+         * for the lifetime of the scheduler task table.
+         */
+        if (i < SCHED_PROFILE_MAX_TASKS) {
+            sched_profile_total_us[i] += time_taken;
+            sched_profile_count[i]++;
+            sched_profile_name[i] = task.name;
+
+            if (time_taken > sched_profile_max_us[i]) {
+                sched_profile_max_us[i] = time_taken;
+            }
+        }
         bool overrun = false;
         if (time_taken > _task_time_allowed) {
             overrun = true;
@@ -303,6 +336,79 @@ void AP_Scheduler::run(uint32_t time_available)
             time_available = 0;
         } else {
             time_available -= time_taken;
+        }
+    }
+
+    /*
+     * Print the tasks that consumed the most total execution time during
+     * the last five-second interval. The report is produced after the
+     * scheduler walk so it does not affect any individual task timing.
+     */
+    const uint32_t profile_now_ms = AP_HAL::millis();
+
+    if (profile_now_ms - sched_profile_last_report_ms >=
+        SCHED_PROFILE_REPORT_PERIOD_MS) {
+
+        sched_profile_last_report_ms = profile_now_ms;
+
+        hal.console->printf(
+            "AP_Scheduler task profile (top %u, 5s):\n",
+            (unsigned)SCHED_PROFILE_TOP_TASKS);
+
+        bool already_printed[SCHED_PROFILE_MAX_TASKS] {};
+
+        for (uint8_t rank = 0; rank < SCHED_PROFILE_TOP_TASKS; rank++) {
+            int16_t best_index = -1;
+            uint64_t best_total_us = 0;
+
+            for (uint16_t task_index = 0;
+                 task_index < (_num_tasks < SCHED_PROFILE_MAX_TASKS
+                                   ? _num_tasks
+                                   : SCHED_PROFILE_MAX_TASKS);
+                 task_index++) {
+
+                if (already_printed[task_index] ||
+                    sched_profile_count[task_index] == 0) {
+                    continue;
+                }
+
+                if (sched_profile_total_us[task_index] > best_total_us) {
+                    best_total_us = sched_profile_total_us[task_index];
+                    best_index = static_cast<int16_t>(task_index);
+                }
+            }
+
+            if (best_index < 0) {
+                break;
+            }
+
+            already_printed[best_index] = true;
+
+            const uint32_t average_us =
+                static_cast<uint32_t>(
+                    sched_profile_total_us[best_index] /
+                    sched_profile_count[best_index]);
+
+            hal.console->printf(
+                "  [%u] %-28s calls=%lu avg=%luus max=%luus total=%lluus\n",
+                (unsigned)best_index,
+                sched_profile_name[best_index] != nullptr
+                    ? sched_profile_name[best_index]
+                    : "<unnamed>",
+                (unsigned long)sched_profile_count[best_index],
+                (unsigned long)average_us,
+                (unsigned long)sched_profile_max_us[best_index],
+                (unsigned long long)sched_profile_total_us[best_index]);
+        }
+
+        for (uint16_t task_index = 0;
+             task_index < (_num_tasks < SCHED_PROFILE_MAX_TASKS
+                               ? _num_tasks
+                               : SCHED_PROFILE_MAX_TASKS);
+             task_index++) {
+            sched_profile_total_us[task_index] = 0;
+            sched_profile_max_us[task_index] = 0;
+            sched_profile_count[task_index] = 0;
         }
     }
 

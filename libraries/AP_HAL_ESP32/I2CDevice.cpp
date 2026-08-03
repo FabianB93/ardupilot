@@ -4,8 +4,8 @@
  * Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * This file is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * This file is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
  * See the GNU General Public License for more details.
  *
@@ -39,7 +39,7 @@ I2CDeviceManager::I2CDeviceManager(void)
             businfo[i].soft = true;
             i2c_init(&(businfo[i].sw_handle));
         } else {
-            i2c_config_t i2c_bus_config;
+            i2c_config_t i2c_bus_config = {};
             i2c_bus_config.mode = I2C_MODE_MASTER;
             i2c_bus_config.sda_io_num = i2c_bus_desc[i].sda;
             i2c_bus_config.scl_io_num = i2c_bus_desc[i].scl;
@@ -47,10 +47,12 @@ I2CDeviceManager::I2CDeviceManager(void)
             i2c_bus_config.scl_pullup_en = GPIO_PULLUP_ENABLE;
             i2c_bus_config.master.clk_speed = i2c_bus_desc[i].speed;
             i2c_bus_config.clk_flags = 0;
+
             i2c_port_t p = i2c_bus_desc[i].port;
             businfo[i].port = p;
             businfo[i].bus_clock = i2c_bus_desc[i].speed;
             businfo[i].soft = false;
+
             i2c_param_config(p, &i2c_bus_config);
             i2c_driver_install(p, I2C_MODE_MASTER, 0, 0, ESP_INTR_FLAG_IRAM);
             i2c_filter_enable(p, 7);
@@ -58,7 +60,11 @@ I2CDeviceManager::I2CDeviceManager(void)
     }
 }
 
-I2CDevice::I2CDevice(uint8_t busnum, uint8_t address, uint32_t bus_clock, bool use_smbus, uint32_t timeout_ms) :
+I2CDevice::I2CDevice(uint8_t busnum,
+                     uint8_t address,
+                     uint32_t bus_clock,
+                     bool use_smbus,
+                     uint32_t timeout_ms) :
     bus(I2CDeviceManager::businfo[busnum]),
     _retries(10),
     _address(address),
@@ -75,8 +81,10 @@ I2CDevice::~I2CDevice()
     free(pname);
 }
 
-bool I2CDevice::transfer(const uint8_t *send, uint32_t send_len,
-                         uint8_t *recv, uint32_t recv_len)
+bool I2CDevice::transfer(const uint8_t *send,
+                         uint32_t send_len,
+                         uint8_t *recv,
+                         uint32_t recv_len)
 {
     if (!bus.semaphore.check_owner()) {
         printf("I2C: not owner of 0x%x\n", (unsigned)get_bus_id());
@@ -84,45 +92,75 @@ bool I2CDevice::transfer(const uint8_t *send, uint32_t send_len,
     }
 
     bool result = false;
+
     if (bus.soft) {
-        uint8_t flag_wr = (recv_len == 0 || recv == nullptr) ? I2C_NOSTOP : 0;
+        const uint8_t flag_wr =
+            (recv_len == 0 || recv == nullptr) ? I2C_NOSTOP : 0;
+
         if (send_len != 0 && send != nullptr) {
-            //tx with optional rx (after tx)
             i2c_write_bytes(&bus.sw_handle,
                             _address,
                             send,
                             send_len,
                             flag_wr);
         }
+
         if (recv_len != 0 && recv != nullptr) {
-            //rx only or rx after tx
-            //rx separated from tx by (re)start
             i2c_read_bytes(&bus.sw_handle,
                            _address,
-                           (uint8_t *)recv, recv_len, 0);
+                           recv,
+                           recv_len,
+                           0);
         }
-        result = true; //TODO check all
+
+        result = true;
     } else {
         i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        if (cmd == nullptr) {
+            return false;
+        }
+
         if (send_len != 0 && send != nullptr) {
-            //tx with optional rx (after tx)
             i2c_master_start(cmd);
-            i2c_master_write_byte(cmd, (_address << 1) | I2C_MASTER_WRITE, true);
-            i2c_master_write(cmd, (uint8_t*)send, send_len, true);
+            i2c_master_write_byte(
+                cmd,
+                (_address << 1) | I2C_MASTER_WRITE,
+                true);
+            i2c_master_write(
+                cmd,
+                const_cast<uint8_t *>(send),
+                send_len,
+                true);
         }
+
         if (recv_len != 0 && recv != nullptr) {
-            //rx only or rx after tx
-            //rx separated from tx by (re)start
             i2c_master_start(cmd);
-            i2c_master_write_byte(cmd, (_address << 1) | I2C_MASTER_READ, true);
-            i2c_master_read(cmd, (uint8_t *)recv, recv_len, I2C_MASTER_LAST_NACK);
+            i2c_master_write_byte(
+                cmd,
+                (_address << 1) | I2C_MASTER_READ,
+                true);
+            i2c_master_read(
+                cmd,
+                recv,
+                recv_len,
+                I2C_MASTER_LAST_NACK);
         }
+
         i2c_master_stop(cmd);
 
-        uint32_t timeout_ms = 1 + 16L * (send_len + recv_len) * 1000 / bus.bus_clock;
+        uint32_t timeout_ms =
+            1 + 16L * (send_len + recv_len) * 1000 / bus.bus_clock;
         timeout_ms = MAX(timeout_ms, _timeout_ms);
-        for (int i = 0; !result && i < _retries; i++) {
-            result = (i2c_master_cmd_begin(bus.port, cmd, pdMS_TO_TICKS(timeout_ms)) == ESP_OK);
+
+        for (uint8_t i = 0; !result && i < _retries; i++) {
+            const esp_err_t error =
+                i2c_master_cmd_begin(
+                    bus.port,
+                    cmd,
+                    pdMS_TO_TICKS(timeout_ms));
+
+            result = (error == ESP_OK);
+
             if (!result) {
                 i2c_reset_tx_fifo(bus.port);
                 i2c_reset_rx_fifo(bus.port);
@@ -138,22 +176,26 @@ bool I2CDevice::transfer(const uint8_t *send, uint32_t send_len,
 /*
   register a periodic callback
 */
-AP_HAL::Device::PeriodicHandle I2CDevice::register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb cb)
+AP_HAL::Device::PeriodicHandle
+I2CDevice::register_periodic_callback(uint32_t period_usec,
+                                      AP_HAL::Device::PeriodicCb cb)
 {
     return bus.register_periodic_callback(period_usec, cb, this);
 }
 
-
 /*
   adjust a periodic callback
 */
-bool I2CDevice::adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec)
+bool I2CDevice::adjust_periodic_callback(
+    AP_HAL::Device::PeriodicHandle h,
+    uint32_t period_usec)
 {
     return bus.adjust_timer(h, period_usec);
 }
 
 AP_HAL::I2CDevice *
-I2CDeviceManager::get_device_ptr(uint8_t bus, uint8_t address,
+I2CDeviceManager::get_device_ptr(uint8_t bus,
+                                 uint8_t address,
                                  uint32_t bus_clock,
                                  bool use_smbus,
                                  uint32_t timeout_ms)
@@ -161,7 +203,13 @@ I2CDeviceManager::get_device_ptr(uint8_t bus, uint8_t address,
     if (bus >= ARRAY_SIZE(i2c_bus_desc)) {
         return nullptr;
     }
-    return NEW_NOTHROW I2CDevice(bus, address, bus_clock, use_smbus, timeout_ms);
+
+    return NEW_NOTHROW I2CDevice(
+        bus,
+        address,
+        bus_clock,
+        use_smbus,
+        timeout_ms);
 }
 
 /*
@@ -178,11 +226,13 @@ uint32_t I2CDeviceManager::get_bus_mask(void) const
 uint32_t I2CDeviceManager::get_bus_mask_internal(void) const
 {
     uint32_t result = 0;
+
     for (size_t i = 0; i < ARRAY_SIZE(i2c_bus_desc); i++) {
         if (i2c_bus_desc[i].internal) {
             result |= (1u << i);
         }
     }
+
     return result;
 }
 

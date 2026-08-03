@@ -104,6 +104,11 @@
 // disble temp cal of gyros by default
 #define HAL_INS_TEMPERATURE_CAL_ENABLE 0
 
+// enable the fast-rate INS/rate-controller loop on ESP32
+#ifndef HAL_INS_RATE_LOOP
+#define HAL_INS_RATE_LOOP 1
+#endif
+
 //turn off a bunch of advanced plane scheduler table things. see Plane.cpp
 #define AP_ADVANCEDFAILSAFE_ENABLED 0
 #define AP_ICENGINE_ENABLED 0
