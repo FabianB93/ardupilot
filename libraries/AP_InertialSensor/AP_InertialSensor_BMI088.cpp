@@ -56,11 +56,26 @@
 #define REGG_FIFO_CONFIG_1 0x3E
 #define REGG_FIFO_DATA     0x3F
 
-#define ACCEL_BACKEND_SAMPLE_RATE   1600
-#define GYRO_BACKEND_SAMPLE_RATE    2000
+/*
+ * Accelerometer and gyroscope FIFOs are both serviced at 400 Hz.
+ *
+ * At the configured sensor ODRs this produces approximately:
+ *
+ *   accelerometer: 400 Hz / 400 Hz = 1 frame per callback
+ *   gyroscope:    1000 Hz / 400 Hz = 2.5 frames per callback
+ *
+ * The accelerometer callback now matches the 400 Hz ArduCopter main loop.
+ * A limit of two accel frames allows short scheduling delays to be caught
+ * up without processing an unnecessarily large FIFO batch.
+ */
+#define ACCEL_BACKEND_SAMPLE_RATE   400
+#define GYRO_BACKEND_SAMPLE_RATE    1000
 
-const uint32_t ACCEL_BACKEND_PERIOD_US = 1000000UL / ACCEL_BACKEND_SAMPLE_RATE;
-const uint32_t GYRO_BACKEND_PERIOD_US = 1000000UL / GYRO_BACKEND_SAMPLE_RATE;
+static constexpr uint32_t ACCEL_BACKEND_PERIOD_US = 2500;
+static constexpr uint32_t GYRO_BACKEND_PERIOD_US = 2500;
+
+static constexpr uint8_t BMI088_MAX_ACCEL_FRAMES_PER_CALLBACK = 2;
+static constexpr uint8_t BMI088_MAX_GYRO_FRAMES_PER_CALLBACK = 6;
 
 extern const AP_HAL::HAL& hal;
 
@@ -310,9 +325,9 @@ void AP_InertialSensor_BMI088::read_fifo_accel(void)
         return;
     }
 
-    // don't read more than 8 frames at a time
-    if (fifo_length > 8*7) {
-        fifo_length = 8*7;
+    // limit the amount of FIFO work performed in one callback
+    if (fifo_length > BMI088_MAX_ACCEL_FRAMES_PER_CALLBACK * 7U) {
+        fifo_length = BMI088_MAX_ACCEL_FRAMES_PER_CALLBACK * 7U;
     }
     if (fifo_length == 0) {
         return;
@@ -399,7 +414,7 @@ void AP_InertialSensor_BMI088::read_fifo_gyro(void)
         return;
     }
     const float scale = radians(2000.0f) / 32767.0f;
-    const uint8_t max_frames = 8;
+    const uint8_t max_frames = BMI088_MAX_GYRO_FRAMES_PER_CALLBACK;
     const Vector3i bad_frame{INT16_MIN,INT16_MIN,INT16_MIN};
     Vector3i data[max_frames];
 
@@ -411,7 +426,7 @@ void AP_InertialSensor_BMI088::read_fifo_gyro(void)
 
     num_frames &= 0x7F;
     
-    // don't read more than 8 frames at a time
+    // limit the amount of FIFO work performed in one callback
     num_frames = MIN(num_frames, max_frames);
     if (num_frames == 0) {
         goto check_next;

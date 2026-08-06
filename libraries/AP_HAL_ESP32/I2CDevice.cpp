@@ -12,16 +12,16 @@
  * You should have received a copy of the GNU General Public License along
  * with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+
 #include "I2CDevice.h"
 
 #include <AP_HAL/AP_HAL.h>
-#include <AP_Math/AP_Math.h>
 #include <AP_HAL_ESP32/Semaphores.h>
-#include "Scheduler.h"
+#include <AP_Math/AP_Math.h>
 
 using namespace ESP32;
 
-#define MHZ (1000U*1000U)
+#define MHZ (1000U * 1000U)
 #define KHZ (1000U)
 
 I2CBusDesc i2c_bus_desc[] = { HAL_ESP32_I2C_BUSES };
@@ -30,109 +30,194 @@ I2CBus I2CDeviceManager::businfo[ARRAY_SIZE(i2c_bus_desc)];
 
 I2CDeviceManager::I2CDeviceManager(void)
 {
-    for (uint8_t i=0; i<ARRAY_SIZE(i2c_bus_desc); i++) {
+    for (uint8_t i = 0; i < ARRAY_SIZE(i2c_bus_desc); i++) {
         if (i2c_bus_desc[i].soft) {
             businfo[i].sw_handle.sda = i2c_bus_desc[i].sda;
             businfo[i].sw_handle.scl = i2c_bus_desc[i].scl;
-            //TODO make modular
+            // TODO make modular
             businfo[i].sw_handle.speed = I2C_SPEED_FAST;
             businfo[i].soft = true;
-            i2c_init(&(businfo[i].sw_handle));
-        } else {
-            i2c_config_t i2c_bus_config;
-            i2c_bus_config.mode = I2C_MODE_MASTER;
-            i2c_bus_config.sda_io_num = i2c_bus_desc[i].sda;
-            i2c_bus_config.scl_io_num = i2c_bus_desc[i].scl;
-            i2c_bus_config.sda_pullup_en = GPIO_PULLUP_ENABLE;
-            i2c_bus_config.scl_pullup_en = GPIO_PULLUP_ENABLE;
-            i2c_bus_config.master.clk_speed = i2c_bus_desc[i].speed;
-            i2c_bus_config.clk_flags = 0;
-            i2c_port_t p = i2c_bus_desc[i].port;
-            businfo[i].port = p;
-            businfo[i].bus_clock = i2c_bus_desc[i].speed;
-            businfo[i].soft = false;
-            i2c_param_config(p, &i2c_bus_config);
-            i2c_driver_install(p, I2C_MODE_MASTER, 0, 0, ESP_INTR_FLAG_IRAM);
-            i2c_filter_enable(p, 7);
+            i2c_init(&businfo[i].sw_handle);
+            continue;
+        }
+
+        businfo[i].soft = false;
+        businfo[i].bus_clock = i2c_bus_desc[i].speed;
+
+        i2c_master_bus_config_t bus_config {};
+        bus_config.i2c_port = i2c_bus_desc[i].port;
+        bus_config.sda_io_num = static_cast<gpio_num_t>(i2c_bus_desc[i].sda);
+        bus_config.scl_io_num = static_cast<gpio_num_t>(i2c_bus_desc[i].scl);
+        bus_config.clk_source = I2C_CLK_SRC_DEFAULT;
+        bus_config.glitch_ignore_cnt = 7;
+        bus_config.intr_priority = 0;
+        bus_config.trans_queue_depth = 0;
+        bus_config.flags.enable_internal_pullup = true;
+
+        const esp_err_t result = i2c_new_master_bus(&bus_config, &businfo[i].bus_handle);
+        if (result != ESP_OK) {
+            businfo[i].bus_handle = nullptr;
+            printf("I2C: failed to create master bus %u: %s\n",
+                   static_cast<unsigned>(i),
+                   esp_err_to_name(result));
         }
     }
 }
 
 I2CDevice::I2CDevice(uint8_t busnum, uint8_t address, uint32_t bus_clock, bool use_smbus, uint32_t timeout_ms) :
     bus(I2CDeviceManager::businfo[busnum]),
-    _retries(10),
+    _retries(2),
     _address(address),
-    _timeout_ms(timeout_ms)
+    _timeout_ms(timeout_ms),
+    _bus_clock(bus_clock)
 {
     set_device_bus(busnum);
     set_device_address(address);
-    asprintf(&pname, "I2C:%u:%02x",
-             (unsigned)busnum, (unsigned)address);
+    asprintf(&pname, "I2C:%u:%02x", static_cast<unsigned>(busnum), static_cast<unsigned>(address));
+
+    if (!bus.soft) {
+        configure_device(_address);
+    }
+}
+
+
+bool I2CDevice::configure_device(uint8_t address)
+{
+    if (bus.soft) {
+        _address = address;
+        return true;
+    }
+
+    if (bus.bus_handle == nullptr) {
+        return false;
+    }
+
+    if (device_handle != nullptr) {
+        const esp_err_t remove_result = i2c_master_bus_rm_device(device_handle);
+        if (remove_result != ESP_OK) {
+            return false;
+        }
+        device_handle = nullptr;
+    }
+
+    i2c_device_config_t device_config {};
+    device_config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    device_config.device_address = address;
+    device_config.scl_speed_hz = _bus_clock != 0 ? _bus_clock : bus.bus_clock;
+    device_config.scl_wait_us = 0;
+    device_config.flags.disable_ack_check = false;
+
+    const esp_err_t result = i2c_master_bus_add_device(bus.bus_handle, &device_config, &device_handle);
+    if (result != ESP_OK) {
+        device_handle = nullptr;
+        return false;
+    }
+
+    _address = address;
+    set_device_address(address);
+    return true;
+}
+
+void I2CDevice::set_address(uint8_t address)
+{
+    if (address == _address) {
+        return;
+    }
+
+    configure_device(address);
 }
 
 I2CDevice::~I2CDevice()
 {
+    if (device_handle != nullptr) {
+        const esp_err_t result = i2c_master_bus_rm_device(device_handle);
+        if (result != ESP_OK) {
+            printf("I2C: failed to remove device 0x%02x: %s\n",
+                   static_cast<unsigned>(_address),
+                   esp_err_to_name(result));
+        }
+        device_handle = nullptr;
+    }
+
     free(pname);
 }
 
-bool I2CDevice::transfer(const uint8_t *send, uint32_t send_len,
-                         uint8_t *recv, uint32_t recv_len)
+bool I2CDevice::transfer(const uint8_t *send, uint32_t send_len, uint8_t *recv, uint32_t recv_len)
 {
     if (!bus.semaphore.check_owner()) {
-        printf("I2C: not owner of 0x%x\n", (unsigned)get_bus_id());
+        printf("I2C: not owner of 0x%x\n", static_cast<unsigned>(get_bus_id()));
         return false;
     }
 
-    bool result = false;
-    if (bus.soft) {
-        uint8_t flag_wr = (recv_len == 0 || recv == nullptr) ? I2C_NOSTOP : 0;
-        if (send_len != 0 && send != nullptr) {
-            //tx with optional rx (after tx)
-            i2c_write_bytes(&bus.sw_handle,
-                            _address,
-                            send,
-                            send_len,
-                            flag_wr);
-        }
-        if (recv_len != 0 && recv != nullptr) {
-            //rx only or rx after tx
-            //rx separated from tx by (re)start
-            i2c_read_bytes(&bus.sw_handle,
-                           _address,
-                           (uint8_t *)recv, recv_len, 0);
-        }
-        result = true; //TODO check all
-    } else {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        if (send_len != 0 && send != nullptr) {
-            //tx with optional rx (after tx)
-            i2c_master_start(cmd);
-            i2c_master_write_byte(cmd, (_address << 1) | I2C_MASTER_WRITE, true);
-            i2c_master_write(cmd, (uint8_t*)send, send_len, true);
-        }
-        if (recv_len != 0 && recv != nullptr) {
-            //rx only or rx after tx
-            //rx separated from tx by (re)start
-            i2c_master_start(cmd);
-            i2c_master_write_byte(cmd, (_address << 1) | I2C_MASTER_READ, true);
-            i2c_master_read(cmd, (uint8_t *)recv, recv_len, I2C_MASTER_LAST_NACK);
-        }
-        i2c_master_stop(cmd);
-
-        uint32_t timeout_ms = 1 + 16L * (send_len + recv_len) * 1000 / bus.bus_clock;
-        timeout_ms = MAX(timeout_ms, _timeout_ms);
-        for (int i = 0; !result && i < _retries; i++) {
-            result = (i2c_master_cmd_begin(bus.port, cmd, pdMS_TO_TICKS(timeout_ms)) == ESP_OK);
-            if (!result) {
-                i2c_reset_tx_fifo(bus.port);
-                i2c_reset_rx_fifo(bus.port);
-            }
-        }
-
-        i2c_cmd_link_delete(cmd);
+    if ((send_len != 0 && send == nullptr) || (recv_len != 0 && recv == nullptr)) {
+        return false;
     }
 
-    return result;
+    if (send_len == 0 && recv_len == 0) {
+        return true;
+    }
+
+    if (bus.soft) {
+        const uint8_t flag_wr = recv_len == 0 ? I2C_NOSTOP : 0;
+
+        if (send_len != 0) {
+            i2c_write_bytes(&bus.sw_handle, _address, send, send_len, flag_wr);
+        }
+
+        if (recv_len != 0) {
+            i2c_read_bytes(&bus.sw_handle, _address, recv, recv_len, 0);
+        }
+
+        return true;
+    }
+
+    if (device_handle == nullptr || bus.bus_handle == nullptr) {
+        return false;
+    }
+
+    const uint32_t clock_hz = bus.bus_clock != 0 ? bus.bus_clock : 100000U;
+    uint32_t timeout_ms = 1U + 16UL * (send_len + recv_len) * 1000UL / clock_hz;
+    timeout_ms = MAX(timeout_ms, MAX(_timeout_ms, 5U));
+
+    for (uint8_t attempt = 0; attempt < _retries; attempt++) {
+        esp_err_t result;
+
+        if (send_len != 0 && recv_len != 0) {
+            result = i2c_master_transmit_receive(
+                device_handle,
+                send,
+                send_len,
+                recv,
+                recv_len,
+                static_cast<int>(timeout_ms));
+        } else if (send_len != 0) {
+            result = i2c_master_transmit(
+                device_handle,
+                send,
+                send_len,
+                static_cast<int>(timeout_ms));
+        } else {
+            result = i2c_master_receive(
+                device_handle,
+                recv,
+                recv_len,
+                static_cast<int>(timeout_ms));
+        }
+
+        if (result == ESP_OK) {
+            return true;
+        }
+
+        if (attempt + 1U < _retries) {
+            const esp_err_t reset_result = i2c_master_bus_reset(bus.bus_handle);
+            if (reset_result != ESP_OK) {
+                return false;
+            }
+            taskYIELD();
+        }
+    }
+
+    return false;
 }
 
 /*
@@ -143,7 +228,6 @@ AP_HAL::Device::PeriodicHandle I2CDevice::register_periodic_callback(uint32_t pe
     return bus.register_periodic_callback(period_usec, cb, this);
 }
 
-
 /*
   adjust a periodic callback
 */
@@ -152,16 +236,23 @@ bool I2CDevice::adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint3
     return bus.adjust_timer(h, period_usec);
 }
 
-AP_HAL::I2CDevice *
-I2CDeviceManager::get_device_ptr(uint8_t bus, uint8_t address,
-                                 uint32_t bus_clock,
-                                 bool use_smbus,
-                                 uint32_t timeout_ms)
+AP_HAL::I2CDevice *I2CDeviceManager::get_device_ptr(uint8_t bus, uint8_t address, uint32_t bus_clock, bool use_smbus, uint32_t timeout_ms)
 {
     if (bus >= ARRAY_SIZE(i2c_bus_desc)) {
         return nullptr;
     }
-    return NEW_NOTHROW I2CDevice(bus, address, bus_clock, use_smbus, timeout_ms);
+
+    auto *device = NEW_NOTHROW I2CDevice(bus, address, bus_clock, use_smbus, timeout_ms);
+    if (device == nullptr) {
+        return nullptr;
+    }
+
+    if (!businfo[bus].soft && device->device_handle == nullptr) {
+        delete device;
+        return nullptr;
+    }
+
+    return device;
 }
 
 /*
@@ -178,11 +269,13 @@ uint32_t I2CDeviceManager::get_bus_mask(void) const
 uint32_t I2CDeviceManager::get_bus_mask_internal(void) const
 {
     uint32_t result = 0;
+
     for (size_t i = 0; i < ARRAY_SIZE(i2c_bus_desc); i++) {
         if (i2c_bus_desc[i].internal) {
-            result |= (1u << i);
+            result |= (1U << i);
         }
     }
+
     return result;
 }
 

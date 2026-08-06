@@ -61,7 +61,7 @@ ESP32_I2CBUS  I2C_NUM_1  GPIO_NUM_39  GPIO_NUM_38  400*KHZ   true     false
 # GPIO8 is connected to MPU_INT, but the current ArduPilot BMI088
 # backend uses periodic FIFO reads and does not require this interrupt.
 
-IMU BMI088 I2C:0:0x18 I2C:0:0x69 ROTATION_NONE
+IMU BMI088 I2C:0:0x18 I2C:0:0x69 ROTATION_PITCH_180
 
 define AP_INERTIALSENSOR_BMI088_ENABLED 1
 define INS_MAX_INSTANCES 1
@@ -78,7 +78,7 @@ define HAL_BMI088_DRDY_PIN GPIO_NUM_8
 COMPASS IIS2MDC I2C:0:0x1E false ROTATION_NONE
 
 define AP_COMPASS_IIS2MDC_ENABLED 1
-define AP_COMPASS_PROBING_ENABLED 1
+define AP_COMPASS_PROBING_ENABLED 0
 
 
 # ----------------------------------------------------------------------

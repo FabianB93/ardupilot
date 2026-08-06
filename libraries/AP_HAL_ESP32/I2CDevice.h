@@ -23,7 +23,7 @@
 #include "Scheduler.h"
 #include "DeviceBus.h"
 
-#include "driver/i2c.h"
+#include "driver/i2c_master.h"
 #include "i2c_sw.h"
 
 namespace ESP32
@@ -38,32 +38,32 @@ struct I2CBusDesc {
     bool soft;
 };
 
-class I2CBus : public  DeviceBus
+class I2CBus : public DeviceBus
 {
 public:
-    I2CBus():DeviceBus(Scheduler::I2C_PRIORITY) {};
-    i2c_port_t port;
-    uint32_t bus_clock;
-    _i2c_bus_t sw_handle;
-    bool soft;
+    I2CBus() : DeviceBus(Scheduler::I2C_PRIORITY) {}
+
+    i2c_master_bus_handle_t bus_handle = nullptr;
+    uint32_t bus_clock = 0;
+    _i2c_bus_t sw_handle {};
+    bool soft = false;
 };
+
+class I2CDeviceManager;
 
 class I2CDevice : public AP_HAL::I2CDevice
 {
 public:
     static I2CDevice *from(AP_HAL::I2CDevice *dev)
     {
-        return static_cast<I2CDevice*>(dev);
+        return static_cast<I2CDevice *>(dev);
     }
 
     I2CDevice(uint8_t bus, uint8_t address, uint32_t bus_clock, bool use_smbus, uint32_t timeout_ms);
-    ~I2CDevice();
+    ~I2CDevice() override;
 
     /* See AP_HAL::I2CDevice::set_address() */
-    void set_address(uint8_t address) override
-    {
-        _address = address;
-    }
+    void set_address(uint8_t address) override;
 
     /* See AP_HAL::I2CDevice::set_retries() */
     void set_retries(uint8_t retries) override
@@ -78,69 +78,58 @@ public:
     }
 
     /* See AP_HAL::Device::transfer() */
-    bool transfer(const uint8_t *send, uint32_t send_len,
-                  uint8_t *recv, uint32_t recv_len) override;
+    bool transfer(const uint8_t *send, uint32_t send_len, uint8_t *recv, uint32_t recv_len) override;
 
-    bool read_registers_multiple(uint8_t first_reg, uint8_t *recv,
-                                 uint32_t recv_len, uint8_t times) override
+    bool read_registers_multiple(uint8_t first_reg, uint8_t *recv, uint32_t recv_len, uint8_t times) override
     {
         return false;
-    };
+    }
 
     /* See AP_HAL::Device::register_periodic_callback() */
-    AP_HAL::Device::PeriodicHandle register_periodic_callback(
-        uint32_t period_usec, AP_HAL::Device::PeriodicCb) override;
+    AP_HAL::Device::PeriodicHandle register_periodic_callback(uint32_t period_usec, AP_HAL::Device::PeriodicCb) override;
 
     /* See AP_HAL::Device::adjust_periodic_callback() */
     bool adjust_periodic_callback(AP_HAL::Device::PeriodicHandle h, uint32_t period_usec) override;
 
-    AP_HAL::Semaphore* get_semaphore() override //TODO check all
+    AP_HAL::Semaphore *get_semaphore() override
     {
-        // if asking for invalid bus number use bus 0 semaphore
         return &bus.semaphore;
     }
 
 protected:
+    friend class I2CDeviceManager;
+
+    bool configure_device(uint8_t address);
+
     I2CBus &bus;
+    i2c_master_dev_handle_t device_handle = nullptr;
     uint8_t _retries;
     uint8_t _address;
-    char *pname;
+    char *pname = nullptr;
     uint32_t _timeout_ms;
+    uint32_t _bus_clock;
 };
 
 class I2CDeviceManager : public AP_HAL::I2CDeviceManager
 {
 public:
-    friend class I2CDevice;
-
     static I2CBus businfo[];
 
-    // constructor
     I2CDeviceManager();
 
     static I2CDeviceManager *from(AP_HAL::I2CDeviceManager *i2c_mgr)
     {
-        return static_cast<I2CDeviceManager*>(i2c_mgr);
+        return static_cast<I2CDeviceManager *>(i2c_mgr);
     }
 
     AP_HAL::I2CDevice *get_device_ptr(uint8_t bus, uint8_t address,
-            uint32_t bus_clock=400000,
-            bool use_smbus = false,
-            uint32_t timeout_ms=4) override;
+                                     uint32_t bus_clock = 400000,
+                                     bool use_smbus = false,
+                                     uint32_t timeout_ms = 4) override;
 
-    /*
-      get mask of bus numbers for all configured I2C buses
-     */
     uint32_t get_bus_mask(void) const override;
-
-    /*
-      get mask of bus numbers for all configured external I2C buses
-     */
     uint32_t get_bus_mask_external(void) const override;
-
-    /*
-      get mask of bus numbers for all configured internal I2C buses
-     */
     uint32_t get_bus_mask_internal(void) const override;
 };
+
 }

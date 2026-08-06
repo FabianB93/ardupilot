@@ -21,6 +21,8 @@
 
 #include "AP_Compass_IIS2MDC.h"
 
+#include <AP_HAL/AP_HAL.h>
+
 // IIS2MDC Registers
 #define IIS2MDC_ADDR_CFG_REG_A  0x60
 #define IIS2MDC_ADDR_CFG_REG_B  0x61
@@ -32,28 +34,31 @@
 // IIS2MDC Definitions
 #define IIS2MDC_WHO_AM_I         0b01000000
 #define IIS2MDC_STATUS_REG_READY 0b00001111
+
 // CFG_REG_A
-#define COMP_TEMP_EN    (1 << 7)
-#define MD_CONTINUOUS   (0 << 0)
-#define ODR_100         ((1 << 3) | (1 << 2))
+#define COMP_TEMP_EN    (1U << 7)
+#define MD_CONTINUOUS   (0U << 0)
+#define ODR_100         ((1U << 3) | (1U << 2))
+
 // CFG_REG_B
-#define OFF_CANC        (1 << 1)
+#define OFF_CANC        (1U << 1)
+
 // CFG_REG_C
-#define BDU             (1 << 4)
+#define BDU             (1U << 4)
 
 extern const AP_HAL::HAL &hal;
 
 AP_Compass_Backend *AP_Compass_IIS2MDC::probe(AP_HAL::OwnPtr<AP_HAL::Device> dev,
-        bool force_external,
-        enum Rotation rotation)
+                                              bool force_external,
+                                              enum Rotation rotation)
 {
     if (!dev) {
         return nullptr;
     }
 
-    AP_Compass_IIS2MDC *sensor = NEW_NOTHROW AP_Compass_IIS2MDC(std::move(dev),force_external,rotation);
+    auto *sensor = NEW_NOTHROW AP_Compass_IIS2MDC(std::move(dev), force_external, rotation);
 
-    if (!sensor || !sensor->init()) {
+    if (sensor == nullptr || !sensor->init()) {
         delete sensor;
         return nullptr;
     }
@@ -62,8 +67,8 @@ AP_Compass_Backend *AP_Compass_IIS2MDC::probe(AP_HAL::OwnPtr<AP_HAL::Device> dev
 }
 
 AP_Compass_IIS2MDC::AP_Compass_IIS2MDC(AP_HAL::OwnPtr<AP_HAL::Device> dev,
-        bool force_external,
-        enum Rotation rotation)
+                                       bool force_external,
+                                       enum Rotation rotation)
     : _dev(std::move(dev))
     , _rotation(rotation)
     , _force_external(force_external)
@@ -80,7 +85,8 @@ bool AP_Compass_IIS2MDC::init()
         return false;
     }
 
-    if (!_dev->write_register(IIS2MDC_ADDR_CFG_REG_A, MD_CONTINUOUS | ODR_100 | COMP_TEMP_EN)) {
+    if (!_dev->write_register(IIS2MDC_ADDR_CFG_REG_A,
+                              MD_CONTINUOUS | ODR_100 | COMP_TEMP_EN)) {
         return false;
     }
 
@@ -92,10 +98,7 @@ bool AP_Compass_IIS2MDC::init()
         return false;
     }
 
-    // lower retries for run
     _dev->set_retries(3);
-
-    // register compass instance
     _dev->set_device_type(DEVTYPE_IIS2MDC);
 
     if (!register_compass(_dev->get_bus_id())) {
@@ -108,8 +111,9 @@ bool AP_Compass_IIS2MDC::init()
         set_external(true);
     }
 
-    // Enable 100HZ
-    _dev->register_periodic_callback(10000, FUNCTOR_BIND_MEMBER(&AP_Compass_IIS2MDC::timer, void));
+    _dev->register_periodic_callback(
+        10000U,
+        FUNCTOR_BIND_MEMBER(&AP_Compass_IIS2MDC::timer, void));
 
     return true;
 }
@@ -117,7 +121,8 @@ bool AP_Compass_IIS2MDC::init()
 bool AP_Compass_IIS2MDC::check_whoami()
 {
     uint8_t whoami = 0;
-    if (!_dev->read_registers(IIS2MDC_ADDR_WHO_AM_I, &whoami, 1)){
+
+    if (!_dev->read_registers(IIS2MDC_ADDR_WHO_AM_I, &whoami, 1)) {
         return false;
     }
 
@@ -137,7 +142,9 @@ void AP_Compass_IIS2MDC::timer()
         uint8_t tout1;
     } buffer;
 
-    const float range_scale = 100.f / 65.535f; // +/- 50,000 milligauss, 16bit
+    static uint32_t last_report_ms = 0;
+
+    const float range_scale = 100.0f / 65.535f;
 
     uint8_t status = 0;
     if (!_dev->read_registers(IIS2MDC_ADDR_STATUS_REG, &status, 1)) {
@@ -148,17 +155,54 @@ void AP_Compass_IIS2MDC::timer()
         return;
     }
 
-    if (!_dev->read_registers(IIS2MDC_ADDR_OUTX_L_REG, (uint8_t *) &buffer, sizeof(buffer))) {
+    if (!_dev->read_registers(
+            IIS2MDC_ADDR_OUTX_L_REG,
+            reinterpret_cast<uint8_t *>(&buffer),
+            sizeof(buffer))) {
         return;
     }
 
-    const int16_t x = ((buffer.xout1 << 8) | buffer.xout0);
-    const int16_t y = ((buffer.yout1 << 8) | buffer.yout0);
-    const int16_t z = -1 * ((buffer.zout1 << 8) | buffer.zout0);
+    const int16_t x = static_cast<int16_t>(
+        static_cast<uint16_t>(buffer.xout0) |
+        (static_cast<uint16_t>(buffer.xout1) << 8));
 
-    Vector3f field{ x * range_scale, y * range_scale, z * range_scale };
+    const int16_t y = static_cast<int16_t>(
+        static_cast<uint16_t>(buffer.yout0) |
+        (static_cast<uint16_t>(buffer.yout1) << 8));
+
+    const int16_t z_raw = static_cast<int16_t>(
+        static_cast<uint16_t>(buffer.zout0) |
+        (static_cast<uint16_t>(buffer.zout1) << 8));
+
+    const int16_t z = -z_raw;
+
+    Vector3f field{
+        x * range_scale,
+        y * range_scale,
+        z * range_scale
+    };
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_ESP32
+    const uint32_t now_ms = AP_HAL::millis();
+
+    if (now_ms - last_report_ms >= 1000U) {
+        hal.console->printf(
+            "IIS2MDC: raw=(%d,%d,%d) field=(%.1f,%.1f,%.1f)mG "
+            "magnitude=%.1fmG status=0x%02X\n",
+            static_cast<int>(x),
+            static_cast<int>(y),
+            static_cast<int>(z),
+            static_cast<double>(field.x),
+            static_cast<double>(field.y),
+            static_cast<double>(field.z),
+            static_cast<double>(field.length()),
+            static_cast<unsigned>(status));
+
+        last_report_ms = now_ms;
+    }
+#endif
 
     accumulate_sample(field);
 }
 
-#endif //AP_COMPASS_IIS2MDC_ENABLED
+#endif // AP_COMPASS_IIS2MDC_ENABLED

@@ -557,7 +557,7 @@ void IRAM_ATTR Scheduler::_main_thread(void *arg)
     sched->set_system_initialized();
 
     //initialize WTD for current thread on FASTCPU, all cores will be (1 << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1
-    wdt_init( TWDT_TIMEOUT_MS, 1 << FASTCPU ); // 3 sec
+    wdt_init(TWDT_TIMEOUT_MS, 0); // monitor APM_MAIN only; do not watch the CPU0 idle task
 
 
 #ifdef SCHEDDEBUG
