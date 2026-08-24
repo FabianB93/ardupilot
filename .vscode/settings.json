@@ -25,5 +25,6 @@
             "alignment": "left",
             "tooltip": "Open the ESP32-S3 serial monitor"
         }
-    ]
+    ],
+    "cmake.sourceDirectory": "/Users/Fabian/Documents/GitHub/ardupilot/Tools/ros2/ardupilot_msgs"
 }

@@ -57,25 +57,25 @@
 #define REGG_FIFO_DATA     0x3F
 
 /*
- * Accelerometer and gyroscope FIFOs are both serviced at 400 Hz.
+ * Accelerometer and gyroscope FIFOs are serviced independently:
  *
- * At the configured sensor ODRs this produces approximately:
+ *   accelerometer callback: 400 Hz
+ *   gyroscope callback:    1000 Hz
  *
- *   accelerometer: 400 Hz / 400 Hz = 1 frame per callback
- *   gyroscope:    1000 Hz / 400 Hz = 2.5 frames per callback
- *
- * The accelerometer callback now matches the 400 Hz ArduCopter main loop.
- * A limit of two accel frames allows short scheduling delays to be caught
- * up without processing an unnecessarily large FIFO batch.
+ * The gyro callback now matches the configured 1000 Hz gyro ODR so the FIFO
+ * should normally contain one frame per callback. A larger catch-up batch is
+ * permitted for short scheduler/I2C delays, while a large backlog is discarded
+ * instead of replaying stale gyro data into the estimator.
  */
 #define ACCEL_BACKEND_SAMPLE_RATE   400
 #define GYRO_BACKEND_SAMPLE_RATE    1000
 
 static constexpr uint32_t ACCEL_BACKEND_PERIOD_US = 2500;
-static constexpr uint32_t GYRO_BACKEND_PERIOD_US = 2500;
+static constexpr uint32_t GYRO_BACKEND_PERIOD_US = 1000;
 
 static constexpr uint8_t BMI088_MAX_ACCEL_FRAMES_PER_CALLBACK = 2;
-static constexpr uint8_t BMI088_MAX_GYRO_FRAMES_PER_CALLBACK = 6;
+static constexpr uint8_t BMI088_MAX_GYRO_FRAMES_PER_CALLBACK = 12;
+static constexpr uint8_t BMI088_GYRO_BACKLOG_RESET_THRESHOLD = 20;
 
 extern const AP_HAL::HAL& hal;
 
@@ -273,8 +273,8 @@ bool AP_InertialSensor_BMI088::gyro_init()
         return false;
     }
 
-    // setup filter bandwidth 532Hz, no decimation
-    if (!dev_gyro->write_register(REGG_BW, 0x80, true)) {
+    // setup gyro for 1000 Hz ODR, 116 Hz filter bandwidth
+    if (!dev_gyro->write_register(REGG_BW, 0x02, true)) {
         return false;
     }
 
@@ -413,39 +413,53 @@ void AP_InertialSensor_BMI088::read_fifo_gyro(void)
         _inc_gyro_error_count(gyro_instance);
         return;
     }
+
     const float scale = radians(2000.0f) / 32767.0f;
     const uint8_t max_frames = BMI088_MAX_GYRO_FRAMES_PER_CALLBACK;
     const Vector3i bad_frame{INT16_MIN,INT16_MIN,INT16_MIN};
     Vector3i data[max_frames];
 
     if (num_frames & 0x80) {
-        // fifo overrun, reset, likely caused by scheduling error
+        // FIFO overrun: discard stale backlog and restart streaming.
         dev_gyro->write_register(REGG_FIFO_CONFIG_1, 0x40, true);
+        _inc_gyro_error_count(gyro_instance);
         goto check_next;
     }
 
     num_frames &= 0x7F;
-    
-    // limit the amount of FIFO work performed in one callback
+
+    // If the FIFO has accumulated a large backlog, the samples are already
+    // too old to be useful for attitude estimation. Discard the stale queue
+    // instead of replaying it into AP_InertialSensor with an artificial
+    // sample rate.
+    if (num_frames > BMI088_GYRO_BACKLOG_RESET_THRESHOLD) {
+        dev_gyro->write_register(REGG_FIFO_CONFIG_1, 0x40, true);
+        _inc_gyro_error_count(gyro_instance);
+        goto check_next;
+    }
+
+    // Limit normal catch-up work per callback. At a 1 kHz callback rate this
+    // should normally be one frame; the larger batch only absorbs short
+    // scheduler/I2C delays.
     num_frames = MIN(num_frames, max_frames);
     if (num_frames == 0) {
         goto check_next;
     }
 
-    // adjust the periodic callback to be synchronous with the incoming data
-    // this means that we rarely run read_fifo_gyro() without updating the sensor data
+    // Keep the callback aligned with the configured 1 kHz gyro ODR.
     dev_gyro->adjust_periodic_callback(gyro_periodic_handle, GYRO_BACKEND_PERIOD_US);
 
-    if (!dev_gyro->read_registers(REGG_FIFO_DATA, (uint8_t *)data, num_frames*6)) {
+    if (!dev_gyro->read_registers(REGG_FIFO_DATA, (uint8_t *)data, num_frames * 6U)) {
         _inc_gyro_error_count(gyro_instance);
         goto check_next;
     }
 
-    // data is 16 bits with 2000dps range
+    // Data is 16 bits with 2000 dps range.
     for (uint8_t i = 0; i < num_frames; i++) {
         if (data[i] == bad_frame) {
             continue;
         }
+
         Vector3f gyro(data[i].x, data[i].y, data[i].z);
         gyro *= scale;
 

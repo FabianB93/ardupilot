@@ -72,12 +72,18 @@ define HAL_BMI088_DRDY_PIN GPIO_NUM_8
 # Compass
 # ----------------------------------------------------------------------
 #
-# The IIS2MDC is mounted directly on the flight-controller PCB.
-# false means that the compass is not forced to be treated as external.
+# Internal IIS2MDC on the flight-controller PCB is temporarily disabled.
+#
+# COMPASS IIS2MDC I2C:1:0x1E false ROTATION_NONE
+# define AP_COMPASS_IIS2MDC_ENABLED 1
 
-COMPASS IIS2MDC I2C:0:0x1E false ROTATION_NONE
+#
+# External GY-273 / HMC5883-compatible compass on I2C0.
+# true = external compass.
+#
+COMPASS QMC5883L I2C:1:0x0D true ROTATION_NONE
 
-define AP_COMPASS_IIS2MDC_ENABLED 1
+define AP_COMPASS_QMC5883L_ENABLED 1
 define AP_COMPASS_PROBING_ENABLED 0
 
 

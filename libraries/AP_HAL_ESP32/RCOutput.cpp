@@ -113,6 +113,15 @@ void RCOutput::init()
     printf("RCOutput::init() - channels available: %d \n",(int)MAX_CHANNELS);
     printf("oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo\n");
 
+    // Put all RC output pins into a defined LOW state before MCPWM takes over.
+    // This is especially important for brushed motors driven directly through
+    // MOSFET stages, where any HIGH level immediately produces motor current.
+    for (uint8_t i = 0; i < MAX_CHANNELS; i++) {
+        ESP_ERROR_CHECK(gpio_reset_pin(outputs_pins[i]));
+        ESP_ERROR_CHECK(gpio_set_direction(outputs_pins[i], GPIO_MODE_OUTPUT));
+        ESP_ERROR_CHECK(gpio_set_level(outputs_pins[i], 0));
+    }
+
     _initialized = true; // assume we are initialized, any error will call abort()
 
     RCOutput::pwm_group *curr_group = &pwm_group_list[0];
@@ -164,6 +173,10 @@ void RCOutput::init()
                     .gen_gpio_num = outputs_pins[chan],
                 };
                 ESP_ERROR_CHECK(mcpwm_new_generator(group.h_oper, &generator_config, &ch.h_gen));
+
+                // Keep the output forced LOW until write_int() explicitly releases it.
+                // This avoids a HIGH pulse while the generator actions are configured.
+                ESP_ERROR_CHECK(mcpwm_generator_set_force_level(ch.h_gen, 0, true));
 
                 // configure it to go low on compare threshold (takes priority over going high)
                 ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(ch.h_gen,
@@ -438,6 +451,10 @@ void RCOutput::read(uint16_t *period_us, uint8_t len)
 
 void RCOutput::cork()
 {
+    // Start a new buffered output cycle with an empty pending mask.
+    // Otherwise channels written in an earlier cycle can remain marked
+    // pending and be written again with stale values on a later push().
+    _pending_mask = 0;
     _corked = true;
 }
 
@@ -462,6 +479,9 @@ void RCOutput::push()
         }
     }
 
+    // All buffered outputs for this cycle have been applied.
+    // Clear the mask so stale channels cannot be replayed on the next push().
+    _pending_mask = 0;
     _corked = false;
 }
 
@@ -490,13 +510,19 @@ void RCOutput::write_int(uint8_t chan, uint16_t period_us)
     ch.value = period_us;
 
     uint16_t compare_value;
+    int force_level = -1;
     switch(ch.group->current_mode) {
     case MODE_PWM_BRUSHED: {
         float duty = 0;
         if (period_us <= _esc_pwm_min) {
             duty = 0;
+            // A compare value of zero coincides with the timer EMPTY event.
+            // Force the generator LOW explicitly instead of relying on event
+            // priority for the motor-off state.
+            force_level = 0;
         } else if (period_us >= _esc_pwm_max) {
             duty = 1;
+            force_level = 1;
         } else {
             duty = ((float)(period_us - _esc_pwm_min))/(_esc_pwm_max - _esc_pwm_min);
         }
@@ -511,10 +537,15 @@ void RCOutput::write_int(uint8_t chan, uint16_t period_us)
     case MODE_PWM_NONE:
     default:
         compare_value = 0;
+        force_level = 0;
         break;
     }
 
+    // Update the compare value before releasing a previously forced level.
+    // For brushed 0% this keeps the MOSFET gate permanently LOW; for 100%
+    // it keeps it permanently HIGH; intermediate duty cycles use MCPWM.
     ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(ch.h_cmpr, compare_value));
+    ESP_ERROR_CHECK(mcpwm_generator_set_force_level(ch.h_gen, force_level, true));
 }
 
 /*

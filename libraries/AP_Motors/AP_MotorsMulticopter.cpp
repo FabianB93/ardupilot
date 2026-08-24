@@ -725,10 +725,16 @@ void AP_MotorsMulticopter::output_logic()
                 _spin_up_ratio = 1.0f;
                 if (!_spin_up_complete) {
                     // Spin up is complete.
-                    // Enable spoolup block to hold the aircraft in GROUND_IDLE.
-                    // Main code should start checks when the block is enabled and remove the lock when ready.
                     _spin_up_complete = true;
+
+#if HAL_WITH_ESC_TELEM
+                    // Hold in GROUND_IDLE until the pre-takeoff checks release the block.
                     set_spoolup_block(true);
+#else
+                    // No ESC telemetry based takeoff check is compiled in, so there is
+                    // nothing that could release a spoolup block.
+                    set_spoolup_block(false);
+#endif
                 }
             }
             if (_spin_up_complete && !get_spoolup_block()) {

@@ -1,5 +1,20 @@
 # Default parameters for ESP32-S3 Drone
 
+# Quadcopter with four brushed DC motors
+FRAME_CLASS,1
+MOT_PWM_TYPE,3
+RC_SPEED,32000
+
+# Motor output mapping
+# QGC/ArduPilot A -> physical Motor A
+# QGC/ArduPilot B -> physical Motor B
+# QGC/ArduPilot C -> physical Motor C
+# QGC/ArduPilot D -> physical Motor D
+SERVO1_FUNCTION,33
+SERVO2_FUNCTION,36
+SERVO3_FUNCTION,34
+SERVO4_FUNCTION,35
+
 SCHED_LOOP_RATE,100
 
 # Enable Fast Rate Controller
