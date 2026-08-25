@@ -15,19 +15,18 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
-extern "C" {
-#include "esp_h264_enc_single.h"
-#include "esp_h264_enc_single_sw.h"
-}
+static const char *TAG = "AP_JPEG";
 
-static const char *TAG = "AP_H264";
+#ifndef AP_H264_JPEG_QUALITY
+#define AP_H264_JPEG_QUALITY 12
+#endif
+
+#ifndef AP_H264_RTP_JPEG_PAYLOAD_TYPE
+// RTP/AVP static payload type for JPEG (RFC 3551).
+#define AP_H264_RTP_JPEG_PAYLOAD_TYPE 26
+#endif
 
 namespace {
-
-struct NALView {
-    const uint8_t *data;
-    size_t len;
-};
 
 static void log_heap_state(const char *where)
 {
@@ -42,7 +41,246 @@ static void log_heap_state(const char *where)
              unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 }
 
-class RTPH264Sender {
+struct JPEGFrameInfo {
+    const uint8_t *scan = nullptr;
+    size_t scan_len = 0;
+
+    uint16_t width = 0;
+    uint16_t height = 0;
+
+    // RFC 2435 type 0 = 4:2:2, type 1 = 4:2:0.
+    uint8_t type = 0;
+
+    uint8_t qtable_luma[64]{};
+    uint8_t qtable_chroma[64]{};
+    bool have_luma_qtable = false;
+    bool have_chroma_qtable = false;
+
+    uint16_t restart_interval = 0;
+};
+
+static bool marker_has_length(uint8_t marker)
+{
+    // Markers without a 16-bit segment length.
+    if (marker == 0xD8 || marker == 0xD9 || marker == 0x01) {
+        return false;
+    }
+    if (marker >= 0xD0 && marker <= 0xD7) {
+        return false;
+    }
+    return true;
+}
+
+static bool parse_dqt(const uint8_t *data, size_t len, JPEGFrameInfo &info)
+{
+    size_t pos = 0;
+
+    while (pos < len) {
+        const uint8_t pq_tq = data[pos++];
+        const uint8_t precision = pq_tq >> 4;
+        const uint8_t table_id = pq_tq & 0x0F;
+
+        // RFC 2435 quantization-table header below uses 8-bit tables.
+        if (precision != 0) {
+            ESP_LOGE(TAG, "16-bit JPEG quantization tables are not supported");
+            return false;
+        }
+
+        if (pos + 64U > len) {
+            return false;
+        }
+
+        if (table_id == 0) {
+            std::memcpy(info.qtable_luma, data + pos, 64);
+            info.have_luma_qtable = true;
+        } else if (table_id == 1) {
+            std::memcpy(info.qtable_chroma, data + pos, 64);
+            info.have_chroma_qtable = true;
+        }
+
+        pos += 64U;
+    }
+
+    return true;
+}
+
+static bool parse_sof0(const uint8_t *data, size_t len, JPEGFrameInfo &info)
+{
+    // precision(1), height(2), width(2), components(1), then 3 bytes/component
+    if (len < 6) {
+        return false;
+    }
+
+    if (data[0] != 8) {
+        ESP_LOGE(TAG, "JPEG precision %u not supported", unsigned(data[0]));
+        return false;
+    }
+
+    info.height = (uint16_t(data[1]) << 8) | data[2];
+    info.width = (uint16_t(data[3]) << 8) | data[4];
+
+    const uint8_t components = data[5];
+    if (components != 3 || len < size_t(6 + components * 3)) {
+        ESP_LOGE(TAG, "RFC2435 requires 3-component baseline JPEG");
+        return false;
+    }
+
+    uint8_t y_sampling = 0;
+    uint8_t cb_sampling = 0;
+    uint8_t cr_sampling = 0;
+
+    for (uint8_t i = 0; i < components; i++) {
+        const uint8_t component_id = data[6 + i * 3];
+        const uint8_t sampling = data[7 + i * 3];
+
+        if (component_id == 1) {
+            y_sampling = sampling;
+        } else if (component_id == 2) {
+            cb_sampling = sampling;
+        } else if (component_id == 3) {
+            cr_sampling = sampling;
+        }
+    }
+
+    if (y_sampling == 0x21 && cb_sampling == 0x11 && cr_sampling == 0x11) {
+        info.type = 0; // 4:2:2
+    } else if (y_sampling == 0x22 && cb_sampling == 0x11 && cr_sampling == 0x11) {
+        info.type = 1; // 4:2:0
+    } else {
+        ESP_LOGE(TAG,
+                 "unsupported JPEG sampling: Y=0x%02x Cb=0x%02x Cr=0x%02x",
+                 y_sampling, cb_sampling, cr_sampling);
+        return false;
+    }
+
+    return true;
+}
+
+static bool parse_jpeg_for_rtp(const uint8_t *jpeg, size_t jpeg_len, JPEGFrameInfo &info)
+{
+    if (jpeg == nullptr || jpeg_len < 4 ||
+        jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
+        ESP_LOGE(TAG, "invalid JPEG SOI");
+        return false;
+    }
+
+    size_t pos = 2;
+
+    while (pos + 1 < jpeg_len) {
+        // Locate the next marker prefix.
+        while (pos < jpeg_len && jpeg[pos] != 0xFF) {
+            pos++;
+        }
+        if (pos >= jpeg_len) {
+            break;
+        }
+
+        while (pos < jpeg_len && jpeg[pos] == 0xFF) {
+            pos++;
+        }
+        if (pos >= jpeg_len) {
+            break;
+        }
+
+        const uint8_t marker = jpeg[pos++];
+
+        if (marker == 0xD9) {
+            break;
+        }
+
+        if (!marker_has_length(marker)) {
+            continue;
+        }
+
+        if (pos + 2 > jpeg_len) {
+            return false;
+        }
+
+        const uint16_t seg_len = (uint16_t(jpeg[pos]) << 8) | jpeg[pos + 1];
+        if (seg_len < 2) {
+            return false;
+        }
+
+        pos += 2;
+        const size_t payload_len = size_t(seg_len) - 2U;
+
+        if (pos + payload_len > jpeg_len) {
+            return false;
+        }
+
+        const uint8_t *payload = jpeg + pos;
+
+        switch (marker) {
+        case 0xDB: // DQT
+            if (!parse_dqt(payload, payload_len, info)) {
+                return false;
+            }
+            break;
+
+        case 0xC0: // SOF0 - baseline DCT
+            if (!parse_sof0(payload, payload_len, info)) {
+                return false;
+            }
+            break;
+
+        case 0xDD: // DRI
+            if (payload_len != 2) {
+                return false;
+            }
+            info.restart_interval =
+                (uint16_t(payload[0]) << 8) | payload[1];
+            break;
+
+        case 0xDA: { // SOS
+            // Entropy-coded scan begins immediately after the SOS segment.
+            const size_t scan_start = pos + payload_len;
+            if (scan_start >= jpeg_len) {
+                return false;
+            }
+
+            size_t scan_end = jpeg_len;
+
+            // Drop the final EOI marker from the RTP JPEG payload.
+            if (jpeg_len >= 2 &&
+                jpeg[jpeg_len - 2] == 0xFF &&
+                jpeg[jpeg_len - 1] == 0xD9) {
+                scan_end -= 2;
+            }
+
+            if (scan_end <= scan_start) {
+                return false;
+            }
+
+            info.scan = jpeg + scan_start;
+            info.scan_len = scan_end - scan_start;
+
+            if (info.width == 0 || info.height == 0 ||
+                !info.have_luma_qtable || !info.have_chroma_qtable) {
+                ESP_LOGE(TAG,
+                         "JPEG missing SOF0 or quantization tables "
+                         "(w=%u h=%u q0=%d q1=%d)",
+                         unsigned(info.width),
+                         unsigned(info.height),
+                         int(info.have_luma_qtable),
+                         int(info.have_chroma_qtable));
+                return false;
+            }
+
+            return true;
+        }
+
+        default:
+            break;
+        }
+
+        pos += payload_len;
+    }
+
+    ESP_LOGE(TAG, "JPEG SOS marker not found");
+    return false;
+}
+
+class RTPJPEG2435Sender {
 public:
     bool begin(const char *ip, uint16_t port)
     {
@@ -55,26 +293,11 @@ public:
                  unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
                  unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
 
-        sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-
+        sock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (sock_ < 0) {
-            ESP_LOGE(TAG,
-                     "video socket() failed: errno=%d internal=%u "
-                     "largest_internal=%u dma=%u largest_dma=%u psram=%u",
-                     errno,
-                     unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                     unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
-                     unsigned(heap_caps_get_free_size(MALLOC_CAP_DMA)),
-                     unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
-                     unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
+            ESP_LOGE(TAG, "JPEG RTP socket() failed: errno=%d", errno);
             return false;
         }
-
-        ESP_LOGI(TAG,
-                 "[DBG] socket created: fd=%d internal=%u largest_internal=%u",
-                 sock_,
-                 unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-                 unsigned(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
 
         const int flags = fcntl(sock_, F_GETFL, 0);
         if (flags >= 0) {
@@ -84,14 +307,14 @@ public:
         std::memset(&dest_, 0, sizeof(dest_));
         dest_.sin_family = AF_INET;
         dest_.sin_port = htons(port);
+
         if (inet_aton(ip, &dest_.sin_addr) == 0) {
-            ESP_LOGE(TAG, "invalid QGC destination IP: %s", ip);
-            close(sock_);
-            sock_ = -1;
+            ESP_LOGE(TAG, "invalid destination IP: %s", ip);
+            end();
             return false;
         }
 
-        ESP_LOGI(TAG, "RTP/H264 destination %s:%u", ip, unsigned(port));
+        ESP_LOGI(TAG, "RTP/JPEG RFC2435 destination %s:%u", ip, unsigned(port));
         return true;
     }
 
@@ -103,203 +326,169 @@ public:
         }
     }
 
-    bool send_frame(const uint8_t *data, size_t len)
+    bool send_frame(const uint8_t *jpeg, size_t jpeg_len)
     {
-        NALView nals[24]{};
-        const size_t nal_count = parse_annex_b(data, len, nals, sizeof(nals) / sizeof(nals[0]));
-        if (nal_count == 0) {
-            ESP_LOGW(TAG, "encoded frame contains no Annex-B NAL units");
-            advance_timestamp();
+        JPEGFrameInfo info{};
+        if (!parse_jpeg_for_rtp(jpeg, jpeg_len, info)) {
             return false;
         }
 
-        bool idr = false;
-        for (size_t i = 0; i < nal_count; i++) {
-            const uint8_t type = nals[i].data[0] & 0x1f;
-            if (type == 5) {
-                idr = true;
-            } else if (type == 7) {
-                save_parameter_set(sps_, sps_len_, sizeof(sps_), nals[i]);
-            } else if (type == 8) {
-                save_parameter_set(pps_, pps_len_, sizeof(pps_), nals[i]);
+        if ((info.width % 8U) != 0 || (info.height % 8U) != 0 ||
+            info.width > 2040 || info.height > 2040) {
+            ESP_LOGE(TAG, "RFC2435 unsupported dimensions %ux%u",
+                     unsigned(info.width), unsigned(info.height));
+            return false;
+        }
+
+        /*
+         * RFC 2435 Q=255 means the quantization-table mapping is dynamic.
+         * The first packet of every frame therefore carries both 64-byte
+         * quantization tables exactly as extracted from the JPEG DQT markers.
+         */
+        constexpr uint8_t Q = 255;
+
+        // Restart markers are supported by RFC 2435, but the OV2640 normally
+        // emits JPEG without a DRI segment. Keep this implementation strict
+        // until a camera stream with DRI is actually needed.
+        if (info.restart_interval != 0) {
+            ESP_LOGE(TAG,
+                     "JPEG DRI=%u detected; RFC2435 restart-marker packetization "
+                     "is not enabled yet",
+                     unsigned(info.restart_interval));
+            return false;
+        }
+
+        size_t offset = 0;
+
+        while (offset < info.scan_len) {
+            const bool first = (offset == 0);
+
+            constexpr size_t RTP_HEADER_SIZE = 12;
+            constexpr size_t JPEG_HEADER_SIZE = 8;
+            constexpr size_t QTABLE_HEADER_SIZE = 4;
+            constexpr size_t QTABLE_DATA_SIZE = 128;
+
+            const size_t extra_first =
+                first ? (QTABLE_HEADER_SIZE + QTABLE_DATA_SIZE) : 0U;
+
+            const size_t headers =
+                RTP_HEADER_SIZE + JPEG_HEADER_SIZE + extra_first;
+
+            if (headers >= AP_H264_RTP_MTU) {
+                return false;
             }
+
+            const size_t max_payload = AP_H264_RTP_MTU - headers;
+            const size_t chunk =
+                std::min(max_payload, info.scan_len - offset);
+            const bool last = (offset + chunk == info.scan_len);
+
+            uint8_t packet[AP_H264_RTP_MTU]{};
+            uint8_t *p = packet;
+
+            // RTP header.
+            p[0] = 0x80; // Version 2
+            p[1] = uint8_t(AP_H264_RTP_JPEG_PAYLOAD_TYPE & 0x7FU) |
+                   (last ? 0x80U : 0U);
+            p[2] = uint8_t(sequence_ >> 8);
+            p[3] = uint8_t(sequence_ & 0xFF);
+            p[4] = uint8_t(timestamp_ >> 24);
+            p[5] = uint8_t(timestamp_ >> 16);
+            p[6] = uint8_t(timestamp_ >> 8);
+            p[7] = uint8_t(timestamp_);
+            p[8] = uint8_t(AP_H264_RTP_SSRC >> 24);
+            p[9] = uint8_t(AP_H264_RTP_SSRC >> 16);
+            p[10] = uint8_t(AP_H264_RTP_SSRC >> 8);
+            p[11] = uint8_t(AP_H264_RTP_SSRC);
+            p += RTP_HEADER_SIZE;
+
+            // RFC 2435 main JPEG header.
+            p[0] = 0; // Type-specific: progressive image
+            p[1] = uint8_t((offset >> 16) & 0xFF);
+            p[2] = uint8_t((offset >> 8) & 0xFF);
+            p[3] = uint8_t(offset & 0xFF);
+            p[4] = info.type;
+            p[5] = Q;
+            p[6] = uint8_t(info.width / 8U);
+            p[7] = uint8_t(info.height / 8U);
+            p += JPEG_HEADER_SIZE;
+
+            if (first) {
+                // RFC 2435 Quantization Table header.
+                p[0] = 0; // MBZ
+                p[1] = 0; // 8-bit precision for both tables
+                p[2] = 0;
+                p[3] = QTABLE_DATA_SIZE;
+                p += QTABLE_HEADER_SIZE;
+
+                std::memcpy(p, info.qtable_luma, 64);
+                p += 64;
+                std::memcpy(p, info.qtable_chroma, 64);
+                p += 64;
+            }
+
+            std::memcpy(p, info.scan + offset, chunk);
+            p += chunk;
+
+            const size_t packet_len = size_t(p - packet);
+
+            const ssize_t sent =
+                sendto(sock_,
+                       packet,
+                       packet_len,
+                       0,
+                       reinterpret_cast<const sockaddr *>(&dest_),
+                       sizeof(dest_));
+
+            sequence_++;
+
+            if (sent < 0) {
+                if (errno != EAGAIN &&
+                    errno != EWOULDBLOCK &&
+                    errno != ENETUNREACH) {
+                    ESP_LOGW(TAG,
+                             "RTP/JPEG sendto failed: errno=%d",
+                             errno);
+                }
+                return false;
+            }
+
+            if (size_t(sent) != packet_len) {
+                return false;
+            }
+
+            offset += chunk;
         }
 
-        bool ok = true;
-        if (idr && sps_len_ && pps_len_) {
-            ok &= send_nal(sps_, sps_len_, false);
-            ok &= send_nal(pps_, pps_len_, false);
-        }
-
-        for (size_t i = 0; i < nal_count; i++) {
-            const bool last_nal = (i + 1U == nal_count);
-            ok &= send_nal(nals[i].data, nals[i].len, last_nal);
-        }
-
-        advance_timestamp();
-        return ok;
+        // RFC 2435 uses the normal RTP 90 kHz clock for JPEG.
+        timestamp_ += 90000U / AP_H264_FPS;
+        return true;
     }
 
 private:
-    static bool is_start_code(const uint8_t *p, size_t remaining, size_t &size)
-    {
-        if (remaining >= 3 && p[0] == 0 && p[1] == 0 && p[2] == 1) {
-            size = 3;
-            return true;
-        }
-        if (remaining >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 0 && p[3] == 1) {
-            size = 4;
-            return true;
-        }
-        return false;
-    }
-
-    static size_t parse_annex_b(const uint8_t *data, size_t len, NALView *out, size_t out_cap)
-    {
-        if (!data || !out || len < 4 || out_cap == 0) {
-            return 0;
-        }
-
-        size_t count = 0;
-        size_t pos = 0;
-        while (pos < len && count < out_cap) {
-            size_t sc_len = 0;
-            while (pos < len && !is_start_code(data + pos, len - pos, sc_len)) {
-                ++pos;
-            }
-            if (pos >= len) {
-                break;
-            }
-
-            const size_t nal_start = pos + sc_len;
-            size_t next = nal_start;
-            size_t next_sc = 0;
-            while (next < len && !is_start_code(data + next, len - next, next_sc)) {
-                ++next;
-            }
-
-            if (next > nal_start) {
-                out[count++] = {data + nal_start, next - nal_start};
-            }
-            pos = next;
-        }
-        return count;
-    }
-
-    static void save_parameter_set(uint8_t *dst, size_t &dst_len, size_t dst_cap, const NALView &nal)
-    {
-        if (nal.len <= dst_cap) {
-            std::memcpy(dst, nal.data, nal.len);
-            dst_len = nal.len;
-        }
-    }
-
-    bool send_packet(const uint8_t *payload, size_t payload_len, bool marker)
-    {
-        uint8_t packet[AP_H264_RTP_MTU];
-        if (payload_len + 12U > sizeof(packet)) {
-            return false;
-        }
-
-        packet[0] = 0x80; // RTP v2
-        packet[1] = uint8_t(AP_H264_RTP_PAYLOAD_TYPE & 0x7fU) | (marker ? 0x80U : 0U);
-        packet[2] = uint8_t(sequence_ >> 8);
-        packet[3] = uint8_t(sequence_ & 0xff);
-        packet[4] = uint8_t(timestamp_ >> 24);
-        packet[5] = uint8_t(timestamp_ >> 16);
-        packet[6] = uint8_t(timestamp_ >> 8);
-        packet[7] = uint8_t(timestamp_);
-        packet[8] = uint8_t(AP_H264_RTP_SSRC >> 24);
-        packet[9] = uint8_t(AP_H264_RTP_SSRC >> 16);
-        packet[10] = uint8_t(AP_H264_RTP_SSRC >> 8);
-        packet[11] = uint8_t(AP_H264_RTP_SSRC);
-        std::memcpy(packet + 12, payload, payload_len);
-
-        const ssize_t sent = sendto(sock_, packet, payload_len + 12U, 0,
-                                    reinterpret_cast<const sockaddr *>(&dest_), sizeof(dest_));
-        ++sequence_;
-
-        if (sent < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENETUNREACH) {
-                ESP_LOGD(TAG, "video sendto failed: errno=%d", errno);
-            }
-            return false;
-        }
-        return static_cast<size_t>(sent) == payload_len + 12U;
-    }
-
-    bool send_nal(const uint8_t *data, size_t len, bool last_nal_of_frame)
-    {
-        if (!data || len == 0) {
-            return false;
-        }
-
-        constexpr size_t RTP_HEADER = 12;
-        constexpr size_t FU_HEADERS = 2;
-        constexpr size_t SINGLE_MAX = AP_H264_RTP_MTU - RTP_HEADER;
-        constexpr size_t FU_MAX = AP_H264_RTP_MTU - RTP_HEADER - FU_HEADERS;
-
-        if (len <= SINGLE_MAX) {
-            return send_packet(data, len, last_nal_of_frame);
-        }
-
-        const uint8_t nal_header = data[0];
-        const uint8_t nal_type = nal_header & 0x1fU;
-        const uint8_t fu_indicator = (nal_header & 0xe0U) | 28U;
-
-        size_t pos = 1;
-        bool first = true;
-        bool ok = true;
-        while (pos < len) {
-            const size_t frag = std::min(FU_MAX, len - pos);
-            const bool last_fragment = (pos + frag == len);
-
-            uint8_t payload[FU_MAX + FU_HEADERS];
-            payload[0] = fu_indicator;
-            payload[1] = nal_type |
-                         (first ? 0x80U : 0U) |
-                         (last_fragment ? 0x40U : 0U);
-            std::memcpy(payload + 2, data + pos, frag);
-
-            ok &= send_packet(payload, frag + 2U, last_nal_of_frame && last_fragment);
-            pos += frag;
-            first = false;
-        }
-        return ok;
-    }
-
-    void advance_timestamp()
-    {
-        timestamp_ += AP_H264_RTP_CLOCK_HZ / AP_H264_FPS;
-    }
-
     int sock_ = -1;
     sockaddr_in dest_{};
     uint16_t sequence_ = 0;
     uint32_t timestamp_ = 0;
-    uint8_t sps_[256]{};
-    size_t sps_len_ = 0;
-    uint8_t pps_[128]{};
-    size_t pps_len_ = 0;
 };
 
 bool init_camera()
 {
     ESP_LOGI(TAG, "[DBG] init_camera(): entered");
 
-    /*
-     * ArduPilot already owns I2C1 on GPIO39/38. Setting pin_sccb_sda=-1 makes
-     * esp32-camera use that existing IDF I2C port via sccb_i2c_port instead of
-     * calling i2c_driver_install() a second time.
-     */
     camera_config_t cfg{};
 
-    ESP_LOGI(TAG, "[DBG] camera config: SCCB port=%d XCLK=%dHz FB=PSRAM format=YUV422 size=QVGA", AP_H264_CAM_SCCB_I2C_PORT, AP_H264_CAM_XCLK_HZ);
     cfg.pin_pwdn = AP_H264_CAM_PIN_PWDN;
     cfg.pin_reset = AP_H264_CAM_PIN_RESET;
     cfg.pin_xclk = AP_H264_CAM_PIN_XCLK;
+
+    /*
+     * ArduPilot already owns the selected I2C port. The adapted SCCB driver
+     * reuses that bus when SDA/SCL are -1 and sccb_i2c_port is supplied.
+     */
     cfg.pin_sccb_sda = -1;
     cfg.pin_sccb_scl = -1;
+
     cfg.pin_d7 = AP_H264_CAM_PIN_D7;
     cfg.pin_d6 = AP_H264_CAM_PIN_D6;
     cfg.pin_d5 = AP_H264_CAM_PIN_D5;
@@ -308,38 +497,48 @@ bool init_camera()
     cfg.pin_d2 = AP_H264_CAM_PIN_D2;
     cfg.pin_d1 = AP_H264_CAM_PIN_D1;
     cfg.pin_d0 = AP_H264_CAM_PIN_D0;
+
     cfg.pin_vsync = AP_H264_CAM_PIN_VSYNC;
     cfg.pin_href = AP_H264_CAM_PIN_HREF;
     cfg.pin_pclk = AP_H264_CAM_PIN_PCLK;
+
     cfg.xclk_freq_hz = AP_H264_CAM_XCLK_HZ;
     cfg.ledc_timer = LEDC_TIMER_0;
     cfg.ledc_channel = LEDC_CHANNEL_0;
-    cfg.pixel_format = PIXFORMAT_YUV422;
+
+    /*
+     * Critical change from the H.264 path:
+     * the OV2640 now performs JPEG compression itself.
+     */
+    cfg.pixel_format = PIXFORMAT_JPEG;
     cfg.frame_size = FRAMESIZE_QVGA;
-    cfg.jpeg_quality = 0;
+    cfg.jpeg_quality = AP_H264_JPEG_QUALITY;
     cfg.fb_count = 1;
     cfg.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
     cfg.fb_location = CAMERA_FB_IN_PSRAM;
     cfg.sccb_i2c_port = AP_H264_CAM_SCCB_I2C_PORT;
 
-    ESP_LOGI(TAG, "[DBG] calling esp_camera_init()");
+    ESP_LOGI(TAG,
+             "[DBG] camera config: JPEG QVGA quality=%u SCCB=%d XCLK=%dHz",
+             unsigned(AP_H264_JPEG_QUALITY),
+             AP_H264_CAM_SCCB_I2C_PORT,
+             AP_H264_CAM_XCLK_HZ);
+
     const esp_err_t err = esp_camera_init(&cfg);
-    ESP_LOGI(TAG, "[DBG] esp_camera_init() returned: 0x%x", int(err));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_camera_init failed: 0x%x", int(err));
         return false;
     }
 
-    ESP_LOGI(TAG, "[DBG] querying camera sensor handle");
     sensor_t *sensor = esp_camera_sensor_get();
-    if (sensor) {
-        /* Keep orientation unchanged by default; change here if mechanically required. */
+    if (sensor != nullptr) {
+        // Camera is physically mounted 180 degrees rotated.
         sensor->set_vflip(sensor, 1);
         sensor->set_hmirror(sensor, 1);
     }
 
-    ESP_LOGI(TAG, "[DBG] camera sensor setup complete");
-    ESP_LOGI(TAG, "OV2640 initialized: %ux%u YUV422", AP_H264_WIDTH, AP_H264_HEIGHT);
+    ESP_LOGI(TAG, "OV2640 initialized: JPEG QVGA quality=%u",
+             unsigned(AP_H264_JPEG_QUALITY));
     return true;
 }
 
@@ -347,184 +546,97 @@ bool init_camera()
 
 extern "C" void ap_h264_streamer_run(void)
 {
-    ESP_LOGI(TAG, "[DBG] H264 task entered");
-    ESP_LOGI(TAG, "[DBG] core=%d stack_hwm=%u", xPortGetCoreID(), unsigned(uxTaskGetStackHighWaterMark(nullptr)));
-    ESP_LOGI(TAG, "[DBG] checking PSRAM");
-    const size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    if (free_psram == 0) {
-        ESP_LOGE(TAG, "No PSRAM available; H.264 streaming disabled");
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    ESP_LOGI(TAG, "PSRAM available: %u bytes", unsigned(free_psram));
-    ESP_LOGI(TAG, "[DBG] internal heap free: %u bytes", unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
-
     /*
-     * Memory-sensitive initialization order:
-     *
-     * 1. Initialize camera first, because its DMA setup needs the remaining
-     *    DMA-capable internal RAM.
-     * 2. Create the UDP/RTP socket immediately afterwards, while there is still
-     *    enough normal internal RAM for lwIP.
-     * 3. Only then create the software H.264 encoder, which consumes nearly all
-     *    remaining internal RAM but can use PSRAM for its large working memory.
+     * Function name intentionally retained for now so no Scheduler/HAL API
+     * changes are required while migrating from H.264 to RFC2435 JPEG.
      */
-    RTPH264Sender rtp;
+    ESP_LOGI(TAG, "RFC2435 JPEG video task entered");
+    ESP_LOGI(TAG,
+             "core=%d stack_hwm=%u",
+             xPortGetCoreID(),
+             unsigned(uxTaskGetStackHighWaterMark(nullptr)));
 
-    ESP_LOGI(TAG, "[DBG] starting camera init");
-    log_heap_state("before camera init");
-    if (!init_camera()) {
-        ESP_LOGE(TAG, "[DBG] camera init failed");
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) == 0) {
+        ESP_LOGE(TAG, "No PSRAM available; JPEG streaming disabled");
         vTaskDelete(nullptr);
         return;
     }
 
-    ESP_LOGI(TAG, "[DBG] camera init finished successfully");
+    log_heap_state("before camera init");
+
+    if (!init_camera()) {
+        vTaskDelete(nullptr);
+        return;
+    }
+
     log_heap_state("after camera init");
 
-    ESP_LOGI(TAG, "[DBG] opening RTP socket after camera init to %s:%u",
-             AP_H264_DEST_IP, AP_H264_RTP_PORT);
-    log_heap_state("before RTP socket after camera");
+    RTPJPEG2435Sender rtp;
     if (!rtp.begin(AP_H264_DEST_IP, AP_H264_RTP_PORT)) {
-        ESP_LOGE(TAG, "[DBG] RTP socket creation after camera failed");
         esp_camera_deinit();
         vTaskDelete(nullptr);
         return;
     }
-    log_heap_state("after RTP socket after camera");
 
-    ESP_LOGI(TAG, "[DBG] preparing H264 encoder config");
+    log_heap_state("after RTP socket");
 
-    esp_h264_enc_cfg_sw_t enc_cfg{};
-    enc_cfg.pic_type = ESP_H264_RAW_FMT_YUYV;
-    enc_cfg.gop = AP_H264_GOP;
-    enc_cfg.fps = AP_H264_FPS;
-    enc_cfg.res.width = AP_H264_WIDTH;
-    enc_cfg.res.height = AP_H264_HEIGHT;
-    enc_cfg.rc.bitrate = AP_H264_BITRATE;
-    enc_cfg.rc.qp_min = AP_H264_QP_MIN;
-    enc_cfg.rc.qp_max = AP_H264_QP_MAX;
+    ESP_LOGI(TAG,
+             "RFC2435 JPEG streamer active: QVGA @ %u fps, quality=%u, "
+             "RTP/UDP %s:%u PT=%u",
+             unsigned(AP_H264_FPS),
+             unsigned(AP_H264_JPEG_QUALITY),
+             AP_H264_DEST_IP,
+             AP_H264_RTP_PORT,
+             unsigned(AP_H264_RTP_JPEG_PAYLOAD_TYPE));
 
-    esp_h264_enc_handle_t encoder = nullptr;
-    log_heap_state("before esp_h264_enc_sw_new");
-    ESP_LOGI(TAG, "[DBG] calling esp_h264_enc_sw_new()");
-    esp_h264_err_t hret = esp_h264_enc_sw_new(&enc_cfg, &encoder);
-    ESP_LOGI(TAG, "[DBG] esp_h264_enc_sw_new() returned: %d encoder=%p", int(hret), encoder);
-    log_heap_state("after esp_h264_enc_sw_new");
-    if (hret != ESP_H264_ERR_OK || encoder == nullptr) {
-        ESP_LOGE(TAG, "esp_h264_enc_sw_new failed: %d", int(hret));
-        esp_camera_deinit();
-        rtp.end();
-        vTaskDelete(nullptr);
-        return;
-    }
+    const TickType_t frame_period =
+        pdMS_TO_TICKS(std::max(1U, 1000U / unsigned(AP_H264_FPS)));
 
-    log_heap_state("before esp_h264_enc_open");
-    ESP_LOGI(TAG, "[DBG] calling esp_h264_enc_open()");
-    hret = esp_h264_enc_open(encoder);
-    ESP_LOGI(TAG, "[DBG] esp_h264_enc_open() returned: %d", int(hret));
-    log_heap_state("after esp_h264_enc_open");
-    if (hret != ESP_H264_ERR_OK) {
-        ESP_LOGE(TAG, "esp_h264_enc_open failed: %d", int(hret));
-        esp_h264_enc_del(encoder);
-        esp_camera_deinit();
-        rtp.end();
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    log_heap_state("before H264 output buffer");
-    ESP_LOGI(TAG, "[DBG] allocating H264 output buffer: %u bytes in PSRAM", unsigned(AP_H264_OUTPUT_BUFFER_SIZE));
-    uint8_t *out_buf = static_cast<uint8_t *>(
-        heap_caps_malloc(AP_H264_OUTPUT_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (!out_buf) {
-        ESP_LOGE(TAG, "cannot allocate %u byte H264 output buffer in PSRAM",
-                 unsigned(AP_H264_OUTPUT_BUFFER_SIZE));
-        esp_h264_enc_close(encoder);
-        esp_h264_enc_del(encoder);
-        esp_camera_deinit();
-        rtp.end();
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    ESP_LOGI(TAG, "[DBG] H264 output buffer allocated at %p", out_buf);
-    log_heap_state("after H264 output buffer");
-
-    /*
-     * RTP socket was already created after camera initialization and before
-     * software H.264 encoder creation. Do not create another socket here.
-     */
-
-    ESP_LOGI(TAG, "H264 streamer active: %ux%u @ %u fps, %u bit/s, RTP/UDP %s:%u",
-             AP_H264_WIDTH, AP_H264_HEIGHT, AP_H264_FPS,
-             unsigned(AP_H264_BITRATE), AP_H264_DEST_IP, AP_H264_RTP_PORT);
-
-    ESP_LOGI(TAG, "[DBG] entering capture/encode loop");
-    const TickType_t frame_period = pdMS_TO_TICKS(1000U / AP_H264_FPS);
     TickType_t next_frame = xTaskGetTickCount();
-    uint32_t pts = 0;
     uint32_t frame_counter = 0;
 
     while (true) {
-        if (frame_counter == 0U) {
-            ESP_LOGI(TAG, "[DBG] requesting first camera frame");
-        }
         camera_fb_t *fb = esp_camera_fb_get();
-        if (frame_counter == 0U && fb != nullptr) {
-            ESP_LOGI(TAG, "[DBG] first frame received: len=%u format=%d buf=%p", unsigned(fb->len), int(fb->format), fb->buf);
-        }
-        if (!fb) {
+
+        if (fb == nullptr) {
             ESP_LOGW(TAG, "camera frame capture failed");
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
 
-        const size_t expected = size_t(AP_H264_WIDTH) * AP_H264_HEIGHT * 2U;
-        if (fb->format != PIXFORMAT_YUV422 || fb->len < expected) {
-            ESP_LOGW(TAG, "unexpected camera frame: format=%d len=%u expected>=%u",
-                     int(fb->format), unsigned(fb->len), unsigned(expected));
+        if (fb->format != PIXFORMAT_JPEG || fb->buf == nullptr || fb->len == 0) {
+            ESP_LOGW(TAG,
+                     "unexpected camera frame: format=%d len=%u",
+                     int(fb->format),
+                     unsigned(fb->len));
             esp_camera_fb_return(fb);
             vTaskDelayUntil(&next_frame, frame_period);
             continue;
         }
 
-        esp_h264_enc_in_frame_t in{};
-        esp_h264_enc_out_frame_t out{};
-        in.raw_data.buffer = fb->buf;
-        in.raw_data.len = fb->len;
-        in.pts = pts++;
-        out.raw_data.buffer = out_buf;
-        out.raw_data.len = AP_H264_OUTPUT_BUFFER_SIZE;
+        const bool sent = rtp.send_frame(fb->buf, fb->len);
 
-        if (frame_counter == 0U) {
-            ESP_LOGI(TAG, "[DBG] encoding first frame");
-        }
-        hret = esp_h264_enc_process(encoder, &in, &out);
-        if (frame_counter == 0U) {
-            ESP_LOGI(TAG, "[DBG] first encode returned: ret=%d len=%u", int(hret), unsigned(out.length));
-        }
-        if (hret == ESP_H264_ERR_OK && out.length > 0) {
-            (void)rtp.send_frame(out.raw_data.buffer, out.length);
-        } else {
-            ESP_LOGW(TAG, "H264 encode failed: ret=%d len=%u", int(hret), unsigned(out.length));
+        if (!sent) {
+            ESP_LOGW(TAG,
+                     "RFC2435 frame send failed: frame=%u jpeg_len=%u",
+                     unsigned(frame_counter),
+                     unsigned(fb->len));
         }
 
         esp_camera_fb_return(fb);
 
-        if ((++frame_counter % 50U) == 0U) {
-            ESP_LOGI(TAG, "video alive: frame=%u free_psram=%u free_internal=%u stack_hwm=%u",
+        frame_counter++;
+
+        if (frame_counter == 1U || (frame_counter % 50U) == 0U) {
+            ESP_LOGI(TAG,
+                     "JPEG video alive: frame=%u free_psram=%u "
+                     "free_internal=%u stack_hwm=%u",
                      unsigned(frame_counter),
                      unsigned(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
                      unsigned(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                      unsigned(uxTaskGetStackHighWaterMark(nullptr)));
         }
 
-        /* The video task is intentionally low priority. If encoding took longer
-         * than one frame period, vTaskDelayUntil() returns immediately and the
-         * scheduler still allows all higher-priority ArduPilot work to run first.
-         */
         vTaskDelayUntil(&next_frame, frame_period);
     }
 }

@@ -27,7 +27,7 @@
 /* Conservative first-flight video settings */
 #define AP_H264_WIDTH             320
 #define AP_H264_HEIGHT            240
-#define AP_H264_FPS               3
+#define AP_H264_FPS               10
 #define AP_H264_GOP               5
 #define AP_H264_BITRATE           250000U
 #define AP_H264_QP_MIN            28
