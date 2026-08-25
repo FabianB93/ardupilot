@@ -24,6 +24,11 @@
 #include "freertos/task.h"
 
 #include "esp_task_wdt.h"
+#include "esp_heap_caps.h"
+
+#ifdef HAL_ESP32_H264_STREAMING
+extern "C" void ap_h264_streamer_run(void);
+#endif
 
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Scheduler/AP_Scheduler.h>
@@ -125,6 +130,18 @@ void Scheduler::init()
     } else {
     	hal.console->printf("OK created task _storage_thread on SLOWCPU\n");
     }
+
+#ifdef HAL_ESP32_H264_STREAMING
+    // Do NOT create APM_VIDEO here.
+    //
+    // Creating the video task before ArduPilot setup has completed reserves its
+    // stack and scheduler resources during the most memory-sensitive part of
+    // startup. On esp32s3drone this was observed to prevent callbacks->setup()
+    // from completing.
+    //
+    // APM_VIDEO is created later from _main_thread(), immediately after
+    // set_system_initialized().
+#endif
 
     //   xTaskCreatePinnedToCore(_print_profile, "APM_PROFILE", IO_SS, this, IO_PRIO, nullptr,SLOWCPU);
 }
@@ -300,6 +317,33 @@ bool Scheduler::is_system_initialized()
 {
     return _initialized;
 }
+
+#ifdef HAL_ESP32_H264_STREAMING
+void Scheduler::_video_thread(void *arg)
+{
+    Scheduler *sched = static_cast<Scheduler *>(arg);
+
+    printf("APM_VIDEO: task started on core %d after ArduPilot initialization\n",
+           xPortGetCoreID());
+    fflush(stdout);
+
+    // ArduPilot setup and I2C sensor discovery are already complete when this
+    // task is created. Give WiFi/AP startup a short additional grace period
+    // before initializing the camera and encoder.
+    vTaskDelay(pdMS_TO_TICKS(1500));
+
+    printf("APM_VIDEO: calling ap_h264_streamer_run()\n");
+    fflush(stdout);
+
+    ap_h264_streamer_run();
+
+    printf("APM_VIDEO: ap_h264_streamer_run() returned unexpectedly\n");
+    fflush(stdout);
+
+    sched->_video_task_handle = nullptr;
+    vTaskDelete(nullptr);
+}
+#endif
 
 void IRAM_ATTR Scheduler::_timer_thread(void *arg)
 {
@@ -547,14 +591,87 @@ void IRAM_ATTR Scheduler::_main_thread(void *arg)
 #endif
     Scheduler *sched = (Scheduler *)arg;
 
+    printf("APM_MAIN: entered _main_thread on core %d\n", xPortGetCoreID());
+    fflush(stdout);
+
 #if AP_HAL_ANALOGIN_ENABLED
+    printf("APM_MAIN: starting analogin init\n");
+    fflush(stdout);
     hal.analogin->init();
+    printf("APM_MAIN: analogin init complete\n");
+    fflush(stdout);
 #endif
+
+    printf("APM_MAIN: starting RCOutput init\n");
+    fflush(stdout);
     hal.rcout->init();
+    printf("APM_MAIN: RCOutput init complete\n");
+    fflush(stdout);
+
+    printf("APM_MAIN: entering callbacks->setup()\n");
+    fflush(stdout);
 
     sched->callbacks->setup();
 
+    printf("APM_MAIN: callbacks->setup() returned\n");
+    fflush(stdout);
+
+    printf("APM_MAIN: calling set_system_initialized()\n");
+    fflush(stdout);
     sched->set_system_initialized();
+    printf("APM_MAIN: system initialized\n");
+    fflush(stdout);
+
+#ifdef HAL_ESP32_H264_STREAMING
+    /*
+     * Start video only after the complete ArduPilot setup phase has returned.
+     *
+     * This keeps the VIDEO_SS stack allocation and camera/H.264 task entirely
+     * out of the sensor-discovery/setup phase. It also guarantees that the
+     * shared I2C buses are fully initialized before esp32-camera can use SCCB.
+     */
+    printf("APM_MAIN: creating APM_VIDEO after system initialization\n");
+    fflush(stdout);
+
+    printf("APM_VIDEO: VIDEO_SS=%u bytes\n",
+           (unsigned)VIDEO_SS);
+
+    printf("APM_VIDEO: free internal heap=%u bytes\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+    printf("APM_VIDEO: largest internal block=%u bytes\n",
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    printf("APM_VIDEO: free PSRAM=%u bytes\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
+    fflush(stdout);
+
+    const BaseType_t video_task_result =
+        xTaskCreatePinnedToCoreWithCaps(
+            _video_thread,
+            "APM_VIDEO",
+            VIDEO_SS,
+            sched,
+            VIDEO_PRIO,
+            &sched->_video_task_handle,
+            SLOWCPU,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+    if (video_task_result != pdPASS) {
+        printf("APM_MAIN: FAILED to create APM_VIDEO in PSRAM (result=%ld)\n",
+               (long)video_task_result);
+        fflush(stdout);
+        sched->_video_task_handle = nullptr;
+    } else {
+        printf("APM_MAIN: APM_VIDEO created successfully in PSRAM "
+               "(prio=%d, core=%d, stack=%u)\n",
+               VIDEO_PRIO,
+               SLOWCPU,
+               (unsigned)VIDEO_SS);
+        fflush(stdout);
+    }
+#endif
 
     //initialize WTD for current thread on FASTCPU, all cores will be (1 << CONFIG_FREERTOS_NUMBER_OF_CORES) - 1
     wdt_init(TWDT_TIMEOUT_MS, 0); // monitor APM_MAIN only; do not watch the CPU0 idle task

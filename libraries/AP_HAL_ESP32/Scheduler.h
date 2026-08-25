@@ -84,6 +84,9 @@ public:
     static const int UART_PRIO    = 23; //dont make 24, scheduler suffers a bit. cpu1: a low priority mere might cause wifi thruput to suffer, as wifi gets passed its data frim the uart subsustem in _writebuf/_readbuf
     static const int IO_PRIO      = 5;
     static const int STORAGE_PRIO = 4;
+#ifdef HAL_ESP32_H264_STREAMING
+    static const int VIDEO_PRIO   = 2; // deliberately below storage/IO/RC and far below flight-control tasks
+#endif
 
     static const int TIMER_SS     = 1024*3;
     static const int MAIN_SS      = 1024*5;
@@ -95,6 +98,9 @@ public:
     static const int DEVICE_SS    = 1024*4;     // DEVICEBUS/s
     static const int IO_SS        = 1024*3.5;   // APM_IO
     static const int STORAGE_SS   = 1024*2;     // APM_STORAGE
+#ifdef HAL_ESP32_H264_STREAMING
+    static const int VIDEO_SS     = 1024*16;    // OpenH264 call stack; encoder working memory is allocated from PSRAM
+#endif
 
 private:
     AP_HAL::HAL::Callbacks *callbacks;
@@ -116,6 +122,9 @@ private:
     tskTaskControlBlock* _io_task_handle;
     tskTaskControlBlock* test_task_handle;
     tskTaskControlBlock* _storage_task_handle;
+#ifdef HAL_ESP32_H264_STREAMING
+    tskTaskControlBlock* _video_task_handle;
+#endif
 
     static void _main_thread(void *arg);
     static void _timer_thread(void *arg);
@@ -124,6 +133,9 @@ private:
     static void _uart_thread(void *arg);
     static void _io_thread(void *arg);
     static void _storage_thread(void *arg);
+#ifdef HAL_ESP32_H264_STREAMING
+    static void _video_thread(void *arg);
+#endif
 
     static void set_position(void* arg);
 

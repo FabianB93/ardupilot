@@ -13,7 +13,7 @@
 #
 # Not enabled in this initial version:
 # - GPS
-# - Camera
+# - Camera H.264/RTP streaming is enabled below
 # - nRF24L01
 # - PCA9685 servo outputs
 # - MCP23S08 controlled chip-selects
@@ -128,6 +128,23 @@ ESP32_RCOUT GPIO_NUM_7
 ESP32_RCOUT GPIO_NUM_41
 ESP32_RCOUT GPIO_NUM_40
 
+
+
+# ----------------------------------------------------------------------
+# Camera / H.264 RTP streaming
+# ----------------------------------------------------------------------
+#
+# OV2640 parallel camera interface:
+#   XCLK  GPIO21
+#   SCCB  shares I2C1 (GPIO39 SDA / GPIO38 SCL)
+#   D7..D0 GPIO47,14,13,11,9,3,46,10
+#   VSYNC GPIO45, HREF GPIO48, PCLK GPIO12
+#
+# The native ESP-IDF streamer captures QVGA YUV422, encodes H.264 in software
+# and sends RFC6184 RTP/UDP to QGroundControl port 5600.
+# The ArduPilot wrapper task runs on CPU1 at FreeRTOS priority 2.
+#
+define HAL_ESP32_H264_STREAMING 1
 
 # ----------------------------------------------------------------------
 # Serial ports
